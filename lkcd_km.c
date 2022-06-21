@@ -860,9 +860,15 @@ void fill_bpf_prog(struct one_bpf_prog *curr, struct bpf_prog *prog)
   curr->bpf_func = (void *)prog->bpf_func;
   curr->aux = (void *)prog->aux;
   if ( prog->aux )
+  {
     curr->aux_id = prog->aux->id;
-  else
+    curr->used_map_cnt = prog->aux->used_map_cnt;
+    curr->used_btf_cnt = prog->aux->used_btf_cnt;
+    curr->func_cnt = prog->aux->func_cnt;
+  } else {
     curr->aux_id = 0;
+    curr->used_map_cnt = curr->used_btf_cnt = curr->func_cnt = 0;
+  }
 }
 
 static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
@@ -2736,6 +2742,73 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
         }
       break; /* IOCTL_DEL_CGROUP_BPF */
 
+    case IOCTL_GET_BPF_MAPS:
+      if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+        return -EFAULT;
+      else {
+        struct idr *bmaps = (struct idr *)ptrbuf[0];
+        spinlock_t *lock = (spinlock_t *)ptrbuf[1];
+        unsigned int id;
+        struct bpf_map *map;
+        // check cnt
+        if ( !ptrbuf[2] )
+        {
+          ptrbuf[0] = 0;
+          idr_preload(GFP_KERNEL);
+          // lock
+          spin_lock_bh(lock);
+          // iterate
+          idr_for_each_entry(bmaps, map, id)
+            ptrbuf[0]++;
+          // unlock
+          spin_unlock_bh(lock);
+          idr_preload_end();
+          if (copy_to_user((void*)ioctl_param, (void*)ptrbuf, sizeof(ptrbuf[0])) > 0)
+            return -EFAULT;
+        } else {
+          unsigned long cnt = 0;
+          size_t kbuf_size = sizeof(unsigned long) + ptrbuf[2] * sizeof(struct one_bpf_map);
+          struct one_bpf_map *curr;
+          unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL  | __GFP_ZERO);
+          if ( !buf )
+             return -ENOMEM;
+          curr = (struct one_bpf_map *)(buf + 1);
+          idr_preload(GFP_KERNEL);
+          // lock
+          spin_lock_bh(lock);
+          // iterate
+          idr_for_each_entry(bmaps, map, id)
+          {
+            if ( cnt < ptrbuf[2] )
+            {
+              curr->addr = map;
+              curr->ops = map->ops;
+              curr->inner_map_meta = map->inner_map_meta;
+              curr->btf = map->btf;
+              curr->map_type = map->map_type;
+              curr->key_size = map->key_size;
+              curr->value_size = map->value_size;
+              curr->id = map->id;
+              strlcpy(curr->name, map->name, 16);
+              curr++;
+            }
+            cnt++;
+          }
+          // unlock
+          spin_unlock_bh(lock);
+          idr_preload_end();
+          // copy to user
+          buf[0] = cnt;
+          if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+          {
+             kfree(buf);
+             return -EFAULT;
+          }
+          kfree(buf);
+        }
+      }
+      break; /* IOCTL_GET_BPF_MAPS */
+
     case IOCTL_GET_CGROUP_BPF:
         if ( !bpf_prog_array_length_ptr )
           return -ENOCSI;
@@ -3067,6 +3140,8 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        }
      break; /* IOCTL_GET_NL_SK */
 
+    case IOCTL_GET_BPF_USED_MAPS:
+    case IOCTL_GET_BPF_OPCODES:
     case IOCTL_GET_BPF_PROG_BODY:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 4) > 0 )
          return -EFAULT;
@@ -3084,7 +3159,15 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          idr_for_each_entry(links, prog, id)
          {
            if ( prog == target )
-             body = (char *)prog->bpf_func;
+           {
+             if ( IOCTL_GET_BPF_PROG_BODY == ioctl_num )
+               body = (char *)prog->bpf_func;
+             else if ( IOCTL_GET_BPF_USED_MAPS == ioctl_num && prog->aux )
+               body = (char *)prog->aux->used_maps;
+             else
+               body = (char *)&prog->insnsi;
+             break;
+           }
          }
          spin_unlock_bh(lock);
          if ( !body )
@@ -3706,7 +3789,11 @@ static ssize_t read_kmem(struct file *file, char __user *buf,
 			 * uncached, then it must also be accessed uncached
 			 * by the kernel or data corruption may occur
 			 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,13,0)
+                        kbuf = (char *)p;
+#else
 			kbuf = xlate_dev_kmem_ptr((void *)p);
+#endif
 			if (!virt_addr_valid(kbuf))
 				return -ENXIO;
 

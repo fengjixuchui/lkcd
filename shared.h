@@ -665,9 +665,13 @@ struct one_bpf_prog
   unsigned int len;
   unsigned int jited_len;
   unsigned char tag[8];
-  unsigned int aux_id;
-  void *aux;  
   void *bpf_func;
+  // all field below from bpf_prog_aux 
+  void *aux;
+  unsigned int aux_id;
+  unsigned int used_map_cnt;
+  unsigned int used_btf_cnt;
+  unsigned int func_cnt;
 };
 
 struct one_bpf_links
@@ -738,13 +742,29 @@ struct one_trace_event_call
 //  else long size + N * one_bpf_prog
 #define IOCTL_GET_BPF_PROGS            _IOR(IOCTL_NUM, 0x35, int*)
 
-// read bpf prog body
+// read bpf jit prog body
 // in params:
 //  0 - idr address (prog_idr)
 //  1 - prog_idr_lock spinlock_t
 //  2 - address of bpf_prog
 //  3 - length
 #define IOCTL_GET_BPF_PROG_BODY        _IOR(IOCTL_NUM, 0x36, int*)
+
+// read bpf opcodes
+// in params:
+//  0 - idr address (prog_idr)
+//  1 - prog_idr_lock spinlock_t
+//  2 - address of bpf_prog
+//  3 - length
+#define IOCTL_GET_BPF_OPCODES          _IOR(IOCTL_NUM, 0x37, int*)
+
+// read bpf aux->used_maps, count in used_map_cnt
+// in params:
+//  0 - idr address (prog_idr)
+//  1 - prog_idr_lock spinlock_t
+//  2 - address of bpf_prog
+//  3 - length
+#define IOCTL_GET_BPF_USED_MAPS        _IOR(IOCTL_NUM, 0x38, int*)
 
 #define CG_BPF_MAX	38
 
@@ -786,7 +806,7 @@ struct one_group_root
 // out params
 //  if count is zero - count of cgroup roots
 //  else long size + N * one_group_root
-#define IOCTL_GET_CGRP_ROOTS           _IOR(IOCTL_NUM, 0x37, int*)
+#define IOCTL_GET_CGRP_ROOTS           _IOR(IOCTL_NUM, 0x39, int*)
 
 // read cgroups for some root
 // in params:
@@ -796,7 +816,7 @@ struct one_group_root
 //  3 - cnt
 // out params
 //  unsigned long + N * one_cgroup
-#define IOCTL_GET_CGROUPS              _IOR(IOCTL_NUM, 0x38, int*)
+#define IOCTL_GET_CGROUPS              _IOR(IOCTL_NUM, 0x3A, int*)
 
 // read BPF progs for some cgroup
 // in params:
@@ -808,7 +828,7 @@ struct one_group_root
 //  5 - cnt
 // out params
 //  unsigned long + N * one_bpf_prog
-#define IOCTL_GET_CGROUP_BPF           _IOR(IOCTL_NUM, 0x39, int*)
+#define IOCTL_GET_CGROUP_BPF           _IOR(IOCTL_NUM, 0x3B, int*)
 
 // Achtung! This ioctl is very dangerous!
 // remove bpf program for some cgroup
@@ -819,6 +839,28 @@ struct one_group_root
 //  3 - address of cgroup to remove BPF prog
 //  4 - bpf_attach_type - index in cg->bpf.effective
 //  5 - bpf address
-#define IOCTL_DEL_CGROUP_BPF           _IOR(IOCTL_NUM, 0x3A, int*)
+#define IOCTL_DEL_CGROUP_BPF           _IOR(IOCTL_NUM, 0x3C, int*)
+
+struct one_bpf_map
+{
+  void *addr;
+  const void *ops;
+  void *inner_map_meta;
+  void *btf;
+  int map_type; // bpf_map_type
+  unsigned int key_size;
+  unsigned int value_size;
+  unsigned int id;
+  char name[16]; // BPF_OBJ_NAME_LEN
+};
+
+// read BPF maps
+// in params:
+//  0 - address of map_idr
+//  1 - address of map_idr_lock
+//  2 - cnt
+// out params
+//  unsigned long + N * one_bpf_map
+#define IOCTL_GET_BPF_MAPS             _IOR(IOCTL_NUM, 0x3D, int*)
 
 #endif /* LKCD_SHARED_H */
