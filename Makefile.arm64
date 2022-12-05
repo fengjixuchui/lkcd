@@ -1,0 +1,10 @@
+obj-m += lkcd.o 
+lkcd-objs += lkcd_km.o
+
+KROOT=~/disc/src/linux/
+
+all: $(add-target)
+	make -C $(KROOT) M=$(PWD) modules 
+
+clean: 
+	make -C $(KROOT) M=$(PWD) clean

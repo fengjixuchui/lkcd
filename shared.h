@@ -106,7 +106,7 @@ struct one_tracepoint_func
  *  kprobes & uprobes
  */
 
-// install/remove test kprobe
+// install/remove my own test kprobe
 // in param 0 - 1 to install, 0 to remove
 #define IOCTL_TEST_KPROBE              _IOR(IOCTL_NUM, 0x11, int*)
 
@@ -125,8 +125,13 @@ struct one_kprobe
   void *addr;  // kprobe.addr
   void *pre_handler;
   void *post_handler;
+  void *fault_handler; // was removed in 5.14
   unsigned int flags;
   int is_aggr;
+  int is_retprobe;
+  // from kretprobe
+  void *kret_handler;
+  void *kret_entry_handler;
 };
 
 // get kprobes for kprobe_table[index]
@@ -169,6 +174,7 @@ struct one_uprobe
   unsigned long cons_cnt;
   unsigned long i_no; // from inode
   unsigned long offset;
+  unsigned long ref_ctr_offset;
   unsigned long flags;
   char name[256];
 };
@@ -672,6 +678,8 @@ struct one_bpf_prog
   unsigned int used_map_cnt;
   unsigned int used_btf_cnt;
   unsigned int func_cnt;
+  unsigned int stack_depth;
+  unsigned int num_exentries;
 };
 
 struct one_bpf_links
@@ -862,5 +870,260 @@ struct one_bpf_map
 // out params
 //  unsigned long + N * one_bpf_map
 #define IOCTL_GET_BPF_MAPS             _IOR(IOCTL_NUM, 0x3D, int*)
+
+struct one_bpf_ksym
+{
+  void *addr;
+  char name[128];
+  unsigned long start;
+  unsigned long end;
+  int prog;
+};
+
+// read bpf ksyms
+// in params:
+//  0 - address of bpf_kallsyms
+//  1 - address of bpf_lock
+//  2 - cnt
+// out params
+//  unsigned long + N * one_bpf_ksym
+#define IOCTL_GET_BPF_KSYMS            _IOR(IOCTL_NUM, 0x3E, int*)
+
+struct one_pmu
+{
+  void *addr;
+  int type;
+  int capabilities;
+  // callbacks
+  void *pmu_enable;
+  void *pmu_disable;
+  void *event_init;
+  void *event_mapped;
+  void *event_unmapped;
+  void *add;
+  void *del;
+  void *start;
+  void *stop;
+  void *read;
+  void *start_txn;
+  void *commit_txn;
+  void *cancel_txn;
+  void *event_idx;
+  void *sched_task;
+  void *swap_task_ctx;
+  void *setup_aux;
+  void *free_aux;
+  void *snapshot_aux;
+  void *addr_filters_validate;
+  void *addr_filters_sync;
+  void *aux_output_match;
+  void *filter_match;
+  void *check_period;
+};
+
+// read registered PMUs
+// in params:
+//  0 - address of pmu_idr
+//  1 - address of pmus_lock
+//  2 - cnt
+// out params
+//  unsigned long + N * one_bpf_ksym
+#define IOCTL_GET_PMUS                 _IOR(IOCTL_NUM, 0x3F, int*)
+
+struct one_ftrace_ops
+{
+  void *addr;
+  void *func;
+  void *saved_func;
+  unsigned long	flags;
+};
+
+// read registered ftrace_ops
+// in params:
+//  0 - address of ftrace_ops_list
+//  1 - address of ftrace_lock - mutex
+//  2 - cnt
+// out params
+//  unsigned long + N * one_ftrace_ops
+#define IOCTL_GET_FTRACE_OPS           _IOR(IOCTL_NUM, 0x40, int*)
+
+struct one_bpf_raw_event
+{
+  void *addr;
+  void *tp; // tracepoint
+  void *func;
+  unsigned int num_args;
+};
+
+// read bpf_raw_event_map between __start__bpf_raw_tp & __stop__bpf_raw_tp
+// in params:
+//  0 - address of __start__bpf_raw_tp
+//  1 - address of __stop__bpf_raw_tp
+//  2 - cnt
+// out params
+//  unsigned long + N * one_bpf_raw_event
+#define IOCTL_GET_BPF_RAW_EVENTS       _IOR(IOCTL_NUM, 0x41, int*)
+
+// read dyn events
+// in params:
+//  0 - address of dyn_event_list
+//  1 - address of event_mutex
+//  2 - cnt
+// out params
+//  unsigned long + N * one_tracepoint_func
+#define IOCTL_GET_DYN_EVENTS           _IOR(IOCTL_NUM, 0x42, int*)
+
+// read trace_uprobe for some uprobe consumer
+// in params:
+//  0 - uprobes_tree address
+//  1 - uprobes_treelock address
+//  2 - address of uprobe. it can be removed so return error ENOENT
+//  3 - address of consumer
+// out params
+//  one_trace_event_call
+#define IOCTL_TRACE_UPROBE             _IOR(IOCTL_NUM, 0x43, int*)
+
+// read all bpf progs from some uprobe
+// in params:
+//  0 - uprobes_tree address
+//  1 - uprobes_treelock address
+//  2 - address of uprobe. it can be removed so return error ENOENT
+//  3 - address of consumer
+//  4 - count (taken from one_trace_event_call->bpf_cnt)
+// out params
+//  N + bpf_prog* * N
+#define IOCTL_TRACE_UPROBE_BPFS        _IOR(IOCTL_NUM, 0x44, int*)
+
+// most fields ripped from https://elixir.bootlin.com/linux/latest/source/include/linux/console.h#L140
+struct one_console
+{
+  void *addr;
+  char name[16];
+  void *write;
+  void *read;
+  void *device;
+  void *unblank;
+  void *setup;
+  void *exit;
+  void *match;
+  // unsigned long dropped;
+  short flags;
+  short index;
+  // int cflags;
+};
+
+// read consoles list
+// in params
+//  0 - count
+// out params
+// N + one_console * N
+#define IOCTL_READ_CONSOLES            _IOR(IOCTL_NUM, 0x45, int*)
+
+// read cpufreq_policy address and count of notifiers
+// in params:
+//  0 - processor index
+// out params
+//  0 - address of cpufreq_policy
+//  1 - count of cpufreq_policy.constraints.min_freq_notifiers
+//  2 - count of cpufreq_policy.constraints.max_freq_notifiers
+#define READ_CPUFREQ_CNT               _IOR(IOCTL_NUM, 0x46, int*)
+
+// read cpufreq_policy.constraints notifiers
+// in params:
+//  0 - processor index
+//  1 - count
+//  2 - 0 for min_freq_notifiers else max_freq_notifiers
+// out params
+//  N + N * void*
+#define READ_CPUFREQ_NTFY              _IOR(IOCTL_NUM, 0x47, int*)
+
+struct clk_ntfy
+{
+  unsigned long clk;
+  unsigned long ntfy;
+};
+
+// read clk_notifier_register notifiers
+// in params:
+//  0 - address of clk_notifier_list
+//  1 - address of prepare_lock mutex
+//  2 - count, if zero - just return count
+// out params
+//  N + N * clk_ntfy
+#define READ_CLK_NTFY                  _IOR(IOCTL_NUM, 0x48, int*)
+
+// read notifiers registered with devfreq_register_notifier
+// in params:
+//  0 - address of devfreq_list
+//  1 - address of devfreq_list_lock mutex
+//  2 - count, if zero - just return count
+// out params
+//  N + N * clk_ntfy
+#define READ_DEVFREQ_NTFY              _IOR(IOCTL_NUM, 0x49, int*)
+
+// test kprobes disabling
+// in params:
+//  0 - kprobe_table address
+//  1 - kprobe_mutex address
+//  2 - index (must be between 0 and nonincluded KPROBE_TABLE_SIZE)
+//  3 - address of kprobe
+//  4 - 0 if disable, 1 if enable
+// out params
+//  0 - 1 if some action was successfull, 0 else
+#define IOCTL_KPROBE_DISABLE           _IOR(IOCTL_NUM, 0x4a, int*)
+
+// patch 1 byte in kernel text
+// in params:
+//  0 - address
+//  1 - byte to patch
+#define IOCTL_PATCH_KTEXT1             _IOR(IOCTL_NUM, 0x4b, int*)
+
+// remove notifier for tests
+// for all ioctls
+// in params
+//  0 - address of block
+//  1 - address of notifier
+// out params:
+//  0 - 1 if notifier was found, 0 else
+
+// for blocking_notifier_chain_register
+#define IOCTL_REM_BNTFY                 _IOR(IOCTL_NUM, 0x4c, int*)
+// for atomic_notifier_chain_register
+#define IOCTL_REM_ANTFY                 _IOR(IOCTL_NUM, 0x4d, int*)
+// for srcu_notifier_chain_register
+#define IOCTL_REM_SNTFY                 _IOR(IOCTL_NUM, 0x4e, int*)
+
+struct ktimer
+{
+  void *addr;
+  void *wq_addr;
+  unsigned long exp;
+  void *func;
+  unsigned int flags;
+};
+
+// dump kernel timers
+// in params:
+//  0 - timer_bases address
+//  1 - count
+// out params
+//  N + N * ktimer
+#define IOCTL_GET_KTIMERS               _IOR(IOCTL_NUM, 0x4f, int*)
+
+struct one_alarm
+{
+  void *addr;
+  void *hr_timer;
+  void *func;
+};
+
+// dump alarm timers
+// in params:
+//  0 - index
+//  1 - count
+// out params
+//  if !count: 0 - count 1 - get_ktime 2 - get_timespec
+// else N + N * one_alarm
+#define IOCTL_GET_ALARMS                _IOR(IOCTL_NUM, 0x50, int*)
 
 #endif /* LKCD_SHARED_H */

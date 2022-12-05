@@ -13,6 +13,8 @@
 #endif
 
 #include <iostream>
+#include <list>
+#include <set>
 #include <elfio/elfio_dump.hpp>
 #include "ksyms.h"
 #include "getopt.h"
@@ -25,12 +27,14 @@
 #include "kmods.h"
 #include "lk.h"
 #include "minfo.h"
+#include "ujit.h"
 #endif
 
 int g_opt_v = 0;
 int g_opt_h = 0;
 int g_dump_bpf_ops = 0;
 int g_event_foff = 0;
+std::set<unsigned long> g_kpe, g_kpd; // enable-disable kprobe, key is just address
 
 using namespace ELFIO;
 
@@ -47,17 +51,24 @@ void usage(const char *prog)
   printf("-B - dump BPF\n");
   printf("-b - check .bss section\n");
   printf("-c - check memory. Achtung - you must first load lkcd driver\n");
+  printf("-C - dump consoles\n");
   printf("-d - use disasm\n");
   printf("-F - dump super-blocks\n");
   printf("-f - dump ftraces\n");  
   printf("-g - dump cgroups\n");
   printf("-h - hexdump\n");
+  printf("-j jit.so\n");
   printf("-H - dump BPF opcodes\n");
   printf("-k - dump kprobes\n");
+  printf("-kp addr byte - patch kernel\n");
+  printf("-kpd addr - disable kprobe\n");
+  printf("-kpe addr - enable kprobe\n");
   printf("-n - dump nets\n");
   printf("-r - check .rodata section\n");
   printf("-S - check security_hooks\n");
   printf("-s - check fs_ops for sysfs files\n");
+  printf("-t - dump tracepoints\n");
+  printf("-T - dump timers\n");
   printf("-u - dump usb_monitor\n");
   printf("-v - verbose mode\n");
   exit(6);
@@ -623,10 +634,111 @@ class dumb_free
    void *m_ptr;
 };
 
+void patch_kernel(int fd, std::map<unsigned long, unsigned char> &what)
+{
+  unsigned long args[2];
+  for ( auto iter: what )
+  {
+    args[0] = iter.first;
+    args[1] = iter.second;
+    int err = ioctl(fd, IOCTL_PATCH_KTEXT1, (int *)args);
+    if ( err )
+      printf("IOCTL_PATCH_KTEXT1 on %p failed, error %d (%s)\n", (void *)iter.first, errno, strerror(errno));
+  }
+}
+
 template <typename T>
 size_t calc_data_size(size_t n)
 {
   return n * sizeof(T) + sizeof(unsigned long);
+}
+
+void dump_consoles(int fd, sa64 delta)
+{
+  unsigned long cnt = 0;
+  int err = ioctl(fd, IOCTL_READ_CONSOLES, (int *)&cnt);
+  if ( err )
+  {
+    printf("IOCTL_READ_CONSOLES count failed, error %d (%s)\n", errno, strerror(errno));
+    return;
+  }
+  printf("registered consoles: %ld\n", cnt);
+  if ( !cnt )
+    return;
+  // alloc enough memory
+  size_t size = calc_data_size<one_console>(cnt);
+  unsigned long *buf = (unsigned long *)malloc(size);
+  if ( !buf )
+  {
+    printf("cannot alloc buffer for consoles, len %lX\n", size);
+    return;
+  }
+  dumb_free<unsigned long> tmp(buf);
+  buf[0] = cnt;
+  err = ioctl(fd, IOCTL_READ_CONSOLES, (int *)buf);
+  if ( err )
+  {
+    printf("IOCTL_READ_CONSOLES failed, error %d (%s)\n", errno, strerror(errno));
+    return;
+  }
+  // dump
+  size = buf[0];
+  one_console *curr = (one_console *)(buf + 1);
+  for ( size_t idx = 0; idx < size; idx++, curr++ )
+  {
+    printf("[%ld] %s at %p flags %X index %d\n", idx, curr->name, curr->addr, curr->flags, curr->index);
+    if ( curr->write )
+      dump_kptr((unsigned long)curr->write, "  write", delta);
+    if ( curr->read )
+      dump_kptr((unsigned long)curr->read, "  read", delta);
+    if ( curr->device )
+      dump_kptr((unsigned long)curr->device, "  device", delta);
+    if ( curr->unblank )
+      dump_kptr((unsigned long)curr->unblank, "  unblank", delta);
+    if ( curr->setup )
+      dump_kptr((unsigned long)curr->setup, "  setup", delta);
+    if ( curr->exit )
+      dump_kptr((unsigned long)curr->exit, "  exit", delta);
+    if ( curr->match )
+      dump_kptr((unsigned long)curr->match, "  match", delta);
+  }
+}
+
+template <typename T, typename F>
+void dump_data1arg(int fd, a64 list, sa64 delta, int code, const char *header, const char *ioctl_name, const char *bname, F func)
+{
+  unsigned long args[2] = { list + delta, 0 };
+  int err = ioctl(fd, code, (int *)args);
+  if ( err )
+  {
+    printf("%s count failed, error %d (%s)\n", ioctl_name, errno, strerror(errno));
+    return;
+  }
+  printf("\n%s at %p: %ld\n", header, (void *)(list + delta), args[0]);
+  if ( !args[0] )
+    return;
+  size_t size = calc_data_size<T>(args[0]);
+  unsigned long *buf = (unsigned long *)malloc(size);
+  if ( !buf )
+  {
+    printf("cannot alloc buffer for %s, len %lX\n", bname, size);
+    return;
+  }
+  dumb_free<unsigned long> tmp(buf);
+  buf[0] = list + delta;
+  buf[1] = args[0];
+  err = ioctl(fd, code, (int *)buf);
+  if ( err )
+  {
+    printf("%s failed, error %d (%s)\n", ioctl_name, errno, strerror(errno));
+    return;
+  }
+  size = buf[0];
+  T *curr = (T *)(buf + 1);
+  for ( size_t idx = 0; idx < size; idx++, curr++ )
+  {
+    func(idx, curr);
+  }
 }
 
 template <typename T, typename F>
@@ -665,6 +777,113 @@ void dump_data2arg(int fd, a64 list, a64 lock, sa64 delta, int code, const char 
   {
     func(idx, curr);
   }
+}
+
+void check_bpf_protos(int fd, sa64 delta)
+{
+  std::list<one_bpf_proto> bpf_protos;
+  if ( !fill_bpf_protos(bpf_protos) )
+    return;
+  for ( auto &c: bpf_protos )
+  {    
+    char *ptr = (char *)c.proto.addr + delta;
+    char *arg = ptr;
+    int err = ioctl(fd, IOCTL_READ_PTR, (int *)&arg);
+    if ( err )
+    {
+       printf("read at %p failed, error %d (%s)\n", ptr, errno, strerror(errno));
+       continue;
+    }
+    char *real = (char *)c.func.addr + delta;
+    if ( real != arg )
+      printf("proto %s at %p patched, func %s at %p must be %p\n", c.proto.name, (char *)c.proto.addr + delta, c.func.name, arg, (char *)c.func.addr + delta);
+  }
+}
+
+void dump_devfreq_ntfy(int fd, a64 list, a64 lock, sa64 delta)
+{
+  if ( !list )
+  {
+    printf("cannot find devfreq_list\n");
+    return;
+  }
+  if ( !lock )
+  {
+    printf("cannot find devfreq_list_lock\n");
+    return;
+  }
+  dump_data2arg<clk_ntfy>(fd, list, lock, delta, READ_DEVFREQ_NTFY, "devfreq_list", "READ_DEVFREQ_NTFY", "clk_ntfy",
+   [=](size_t idx, const clk_ntfy *curr) {
+    printf(" [%ld] devfreq at %p", idx, (void *)curr->clk);
+    dump_kptr((unsigned long)curr->ntfy, " ntfy", delta);
+   }
+  );
+}
+
+void dump_clk_ntfy(int fd, a64 list, a64 lock, sa64 delta)
+{
+  if ( !list )
+  {
+    printf("cannot find clk_notifier_list\n");
+    return;
+  }
+  if ( !lock )
+  {
+    printf("cannot find prepare_lock\n");
+    return;
+  }
+  dump_data2arg<clk_ntfy>(fd, list, lock, delta, READ_CLK_NTFY, "clk_notifier_list", "READ_CLK_NTFY", "clk_ntfy",
+   [=](size_t idx, const clk_ntfy *curr) {
+    printf(" [%ld] clk at %p", idx, (void *)curr->clk);
+    dump_kptr((unsigned long)curr->ntfy, " ntfy", delta);
+   }
+  );
+}
+
+void dump_ftrace_ops(int fd, a64 list, a64 lock, sa64 delta)
+{
+  if ( !list )
+  {
+    printf("cannot find ftrace_ops_list\n");
+    return;
+  }
+  if ( !lock )
+  {
+    printf("cannot find ftrace_lock\n");
+    return;
+  }
+  dump_data2arg<one_ftrace_ops>(fd, list, lock, delta, IOCTL_GET_FTRACE_OPS, "ftrace_ops_list", "IOCTL_GET_FTRACE_OPS", "ftrace_ops",
+   [=](size_t idx, const one_ftrace_ops *curr) {
+    printf(" [%ld] flags %lX at", idx, curr->flags);
+    dump_unnamed_kptr((unsigned long)curr->addr, delta);
+    if ( curr->func )
+      dump_kptr((unsigned long)curr->func, "  func", delta);
+    if ( curr->saved_func )
+      dump_kptr((unsigned long)curr->saved_func, "  saved_func", delta);
+   }
+  );
+}
+
+void dump_dynamic_events(int fd, a64 list, a64 lock, sa64 delta)
+{
+  if ( !list )
+  {
+    printf("cannot find dyn_event_list\n");
+    return;
+  }
+  if ( !lock )
+  {
+    printf("cannot find event_mutex\n");
+    return;
+  }
+  dump_data2arg<one_tracepoint_func>(fd, list, lock, delta, IOCTL_GET_DYN_EVENTS, "dyn_event_list", "IOCTL_GET_DYN_EVENTS", "dyn_event_list",
+   [=](size_t idx, const one_tracepoint_func *curr) {
+    printf(" [%ld] at", idx);
+    dump_unnamed_kptr((unsigned long)curr->addr, delta);
+    if ( curr->data )
+      dump_kptr((unsigned long)curr->data, "  ops", delta);
+    }
+  );
 }
 
 void dump_dynevents_ops(int fd, a64 list, a64 lock, sa64 delta)
@@ -738,6 +957,74 @@ void dump_trace_exports(int fd, a64 list, a64 lock, sa64 delta)
     if ( curr->write )
       dump_kptr((unsigned long)curr->write, "  write", delta);
     }
+  );
+}
+
+void dump_pmus(int fd, a64 list, a64 lock, sa64 delta)
+{
+  if ( !list )
+  {
+    printf("cannot find pmu_idr\n");
+    return;
+  }
+  if ( !lock )
+  {
+    printf("cannot find pmus_lock\n");
+    return;
+  }
+  dump_data2arg<one_pmu>(fd, list, lock, delta, IOCTL_GET_PMUS, "pmus", "IOCTL_GET_PMUS", "pmus",
+   [=](size_t idx, const one_pmu *curr) {
+     printf(" [%ld] type %X capabilities %X at ", idx, curr->type, curr->capabilities);
+     dump_unnamed_kptr((unsigned long)curr->addr, delta);
+     if ( curr->pmu_enable )
+       dump_kptr((unsigned long)curr->pmu_enable, "  pmu_enable", delta);
+     if ( curr->pmu_disable )
+       dump_kptr((unsigned long)curr->pmu_disable, "  pmu_disable", delta);
+     if ( curr->event_init )
+       dump_kptr((unsigned long)curr->event_init, "  event_init", delta);
+     if ( curr->event_mapped )
+       dump_kptr((unsigned long)curr->event_mapped, "  event_mapped", delta);
+     if ( curr->event_unmapped )
+       dump_kptr((unsigned long)curr->event_unmapped, "  event_unmapped", delta);
+     if ( curr->add )
+       dump_kptr((unsigned long)curr->add, "  add", delta);
+     if ( curr->del )
+       dump_kptr((unsigned long)curr->del, "  del", delta);
+     if ( curr->start )
+       dump_kptr((unsigned long)curr->start, "  start", delta);
+     if ( curr->stop )
+       dump_kptr((unsigned long)curr->stop, "  stop", delta);
+     if ( curr->read )
+       dump_kptr((unsigned long)curr->read, "  read", delta);
+     if ( curr->start_txn )
+       dump_kptr((unsigned long)curr->start_txn, "  start_txn", delta);
+     if ( curr->commit_txn )
+       dump_kptr((unsigned long)curr->commit_txn, "  commit_txn", delta);
+     if ( curr->cancel_txn )
+       dump_kptr((unsigned long)curr->cancel_txn, "  cancel_txn", delta);
+     if ( curr->event_idx )
+       dump_kptr((unsigned long)curr->event_idx, "  event_idx", delta);
+     if ( curr->sched_task )
+       dump_kptr((unsigned long)curr->sched_task, "  sched_task", delta);
+     if ( curr->swap_task_ctx )
+       dump_kptr((unsigned long)curr->swap_task_ctx, "  swap_task_ctx", delta);
+     if ( curr->setup_aux )
+       dump_kptr((unsigned long)curr->setup_aux, "  setup_aux", delta);
+     if ( curr->free_aux )
+       dump_kptr((unsigned long)curr->free_aux, "  free_aux", delta);
+     if ( curr->snapshot_aux )
+       dump_kptr((unsigned long)curr->snapshot_aux, "  snapshot_aux", delta);
+     if ( curr->addr_filters_validate )
+       dump_kptr((unsigned long)curr->addr_filters_validate, "  addr_filters_validate", delta);
+     if ( curr->addr_filters_sync )
+       dump_kptr((unsigned long)curr->addr_filters_sync, "  addr_filters_sync", delta);
+     if ( curr->aux_output_match )
+       dump_kptr((unsigned long)curr->aux_output_match, "  aux_output_match", delta);
+     if ( curr->filter_match )
+       dump_kptr((unsigned long)curr->filter_match, "  filter_match", delta);
+     if ( curr->check_period )
+       dump_kptr((unsigned long)curr->check_period, "  check_period", delta);
+   }
   );
 }
 
@@ -884,6 +1171,90 @@ void show_bpf_progs(size_t bpf_size, const one_bpf_prog *curr, sa64 delta)
   }
 }
 
+struct uprobe_args
+{
+  unsigned long a1, a2, a3, a4;
+};
+
+void dump_trace_event_call(int fd, size_t idx, one_trace_event_call *curr, sa64 delta, uprobe_args *ua = NULL)
+{
+    if ( curr->bpf_prog )
+    {
+      if ( curr->perf_cnt )
+        printf(" [%ld] flags %X filter %p perf_cnt %ld bpf_cnt %d at", idx, curr->flags, curr->filter, curr->perf_cnt, curr->bpf_cnt);
+      else
+        printf(" [%ld] flags %X filter %p bpf_cnt %d at", idx, curr->flags, curr->filter, curr->bpf_cnt);
+    } else {
+      if ( curr->perf_cnt )
+        printf(" [%ld] flags %X filter %p perf_cnt %ld at", idx, curr->flags, curr->filter, curr->perf_cnt);
+      else
+        printf(" [%ld] flags %X filter %p at", idx, curr->flags, curr->filter);
+    }
+    dump_unnamed_kptr((unsigned long)curr->addr, delta);
+    if ( curr->evt_class )
+      dump_kptr((unsigned long)curr->evt_class, "  evt_class", delta);
+    if ( curr->tp && (curr->flags & 0x10) )
+      dump_kptr((unsigned long)curr->tp, "  tp", delta);
+    if ( curr->perf_perm )
+      dump_kptr((unsigned long)curr->perf_perm, "  perf_perm", delta);
+    if ( curr->bpf_prog )
+      printf("   bpf_prog: %p\n", (void *)curr->bpf_prog);
+    if ( !curr->bpf_cnt )
+      return;
+    if ( ua )
+    {
+      // if curr->bpf_cnt == 1 then we already dumped it
+      if ( curr->bpf_cnt == 1 )
+        return;
+      // dump addresses of bpf progs for some uprobe
+      const size_t args_size = sizeof(unsigned long) * 5;
+      size_t bpf_size = (1 + curr->bpf_cnt) * sizeof(unsigned long);
+      size_t bsize = bpf_size;
+      if ( bsize < args_size )
+        bsize = args_size;
+      unsigned long *bpf_buf = (unsigned long *)malloc(bsize);
+      if ( !bpf_buf )
+      {
+        printf("dump_trace_event_call: cannot alloc %ld bytes for uprobe %ld bpf_progs\n", bsize, idx);
+        return;
+      }
+      dumb_free<unsigned long> tmp2(bpf_buf);
+      bpf_buf[0] = ua->a1;
+      bpf_buf[1] = ua->a2;
+      bpf_buf[2] = ua->a3;
+      bpf_buf[3] = ua->a4;
+      bpf_buf[4] = curr->bpf_cnt;
+      int err = ioctl(fd, IOCTL_TRACE_UPROBE_BPFS, (int *)bpf_buf);
+      if ( err )
+      {
+        printf("IOCTL_TRACE_UPROBE_BPFS for uprobe %ld bpf_progs failed, error %d (%s)\n", idx, errno, strerror(errno));
+        return;
+      }
+      for ( unsigned long i = 0; i < bpf_buf[0]; ++i )
+        printf("  [%ld] %p\n", i, (void *)bpf_buf[i + 1]);
+    } else {
+      // dump bpf progs for some tracepoint
+      size_t bpf_size = calc_data_size<one_bpf_prog>(curr->bpf_cnt);
+      unsigned long *bpf_buf = (unsigned long *)malloc(bpf_size);
+      if ( !bpf_buf )
+      {
+        printf("dump_trace_event_call: cannot alloc %ld bytes for tracepoint %ld bpf_progs\n", bpf_size, idx);
+        return;
+      }
+      dumb_free<unsigned long> tmp2(bpf_buf);
+      bpf_buf[0] = (unsigned long)curr->addr;
+      bpf_buf[1] = curr->bpf_cnt;
+      int err = ioctl(fd, IOCTL_GET_EVT_CALLS, (int *)bpf_buf);
+      if ( err )
+      {
+        printf("IOCTL_GET_EVT_CALLS for tracepoint %ld bpf_progs failed, error %d (%s)\n", idx, errno, strerror(errno));
+        return;
+      }
+      one_bpf_prog *curr2 = (one_bpf_prog *)(bpf_buf + 1);
+      show_bpf_progs(bpf_buf[0], curr2, delta);
+   }
+}
+
 void dump_registered_trace_event_calls(int fd, sa64 delta)
 {
   unsigned long args[2] = { 0, 0 };
@@ -916,43 +1287,34 @@ void dump_registered_trace_event_calls(int fd, sa64 delta)
   one_trace_event_call *curr = (one_trace_event_call *)(buf + 1);
   for ( size_t idx = 0; idx < size; idx++, curr++ )
   {
-    if ( curr->bpf_prog )
-    {
-      if ( curr->perf_cnt )
-        printf(" [%ld] flags %X filter %p perf_cnt %ld bpf_cnt %d at", idx, curr->flags, curr->filter, curr->perf_cnt, curr->bpf_cnt);
-      else
-        printf(" [%ld] flags %X filter %p bpf_cnt %d at", idx, curr->flags, curr->filter, curr->bpf_cnt);
-    } else {
-      if ( curr->perf_cnt )
-        printf(" [%ld] flags %X filter %p perf_cnt %ld at", idx, curr->flags, curr->filter, curr->perf_cnt);
-      else
-        printf(" [%ld] flags %X filter %p at", idx, curr->flags, curr->filter);
-    }
-    dump_unnamed_kptr((unsigned long)curr->addr, delta);
-    if ( curr->evt_class )
-      dump_kptr((unsigned long)curr->evt_class, "  evt_class", delta);
-    if ( curr->tp && (curr->flags & 0x10) )
-      dump_kptr((unsigned long)curr->tp, "  tp", delta);
-    if ( curr->perf_perm )
-      dump_kptr((unsigned long)curr->perf_perm, "  perf_perm", delta);
-    if ( !curr->bpf_cnt )
-      continue;
-    size_t bpf_size = calc_data_size<one_bpf_prog>(curr->bpf_cnt);
-    unsigned long *bpf_buf = (unsigned long *)malloc(bpf_size);
-    if ( !bpf_buf )
-      continue;
-    dumb_free<unsigned long> tmp2(bpf_buf);
-    bpf_buf[0] = (unsigned long)curr->addr;
-    bpf_buf[1] = curr->bpf_cnt;
-    err = ioctl(fd, IOCTL_GET_EVT_CALLS, (int *)bpf_buf);
-    if ( err )
-    {
-      printf("IOCTL_GET_EVT_CALLS for bpf_progs failed, error %d (%s)\n", errno, strerror(errno));
-      continue;
-    }
-    one_bpf_prog *curr2 = (one_bpf_prog *)(bpf_buf + 1);
-    show_bpf_progs(bpf_buf[0], curr2, delta);
+    dump_trace_event_call(fd, idx, curr, delta);
   }
+}
+
+void dump_bpf_ksyms(int fd, a64 list, a64 lock, sa64 delta)
+{
+  if ( !list )
+  {
+    printf("cannot find bpf_kallsyms\n");
+    return;
+  }
+  if ( !lock )
+  {
+    printf("cannot find bpf_lock\n");
+    return;
+  }
+  dump_data2arg<one_bpf_ksym>(fd, list, lock, delta, IOCTL_GET_BPF_KSYMS, "bpf_kallsyms", "IOCTL_GET_BPF_KSYMS", "bpf_ksyms",
+   [](size_t idx, const one_bpf_ksym *curr) {
+     printf(" [%ld] ksym %p %p %p %d %s\n", idx, curr->addr, (void *)curr->start, (void *)curr->end, curr->prog ? 1 : 0, curr->name);
+   }
+  );
+}
+
+void dump_holes(const char *body, std::list<const char *> *holes)
+{
+  printf("holes %ld\n", holes->size());
+  for ( auto c: *holes )
+   printf("%p %lX\n", c, c - body);
 }
 
 void dump_bpf_progs(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std::string> &map_names)
@@ -976,6 +1338,8 @@ void dump_bpf_progs(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std
     for ( int i = 0; i < 8; i++ )
       printf(" %2.2X", curr->tag[i]);
     printf("\n");
+    printf("  stack_depth: %d\n", curr->stack_depth);
+    printf("  num_exentries: %d\n", curr->num_exentries);
     printf("  type: %d %s\n", curr->prog_type, get_bpf_prog_type_name(curr->prog_type));
     printf("  expected_attach_type: %d %s\n", curr->expected_attach_type, get_bpf_attach_type_name(curr->expected_attach_type));
     if ( curr->used_map_cnt )
@@ -983,9 +1347,13 @@ void dump_bpf_progs(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std
       // dump body
       const size_t args_len = sizeof(unsigned long) * 4;
       size_t body_len = curr->used_map_cnt * sizeof(void *);
+      size_t len = body_len;
+#ifdef _DEBUG
+      printf("body_len %ld\n", body_len);
+#endif /* _DEBUG */
       if ( body_len < args_len )
-        body_len = args_len;
-      unsigned long *l = (unsigned long *)malloc(body_len);
+        len = args_len;
+      unsigned long *l = (unsigned long *)malloc(len);
       if ( !l )
       {
         printf("cannot alloc memory for bpf used maps\n");
@@ -1014,6 +1382,10 @@ void dump_bpf_progs(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std
           printf("   [%d] %p - %s\n", i, map_addr, mi->second.c_str());
       }      
     }
+    unsigned long *jit_body = NULL;
+    unsigned char *curr_jit;
+    dumb_free<unsigned long> jit_tmp;
+    std::list<const char *> holes;
     if ( curr->bpf_func && curr->jited_len )
     {
       dump_kptr2((unsigned long)curr->bpf_func, "  bpf_func", delta);
@@ -1022,27 +1394,29 @@ void dump_bpf_progs(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std
       size_t body_len = curr->jited_len;
       if ( body_len < args_len )
         body_len = args_len;
-      unsigned long *l = (unsigned long *)malloc(body_len);
-      if ( !l )
+      jit_body = (unsigned long *)malloc(body_len);
+      if ( !jit_body )
       {
         printf("cannot alloc memory for bpf jit code\n");
         return;
       }
-      dumb_free<unsigned long> tmp(l);
-      l[0] = list + delta;
-      l[1] = lock + delta;
-      l[2] = (unsigned long)curr->prog;
-      l[3] = curr->jited_len;
-      int err = ioctl(fd, IOCTL_GET_BPF_PROG_BODY, (int *)l);
+      jit_tmp = jit_body;
+      curr_jit = (unsigned char *)jit_body;
+      jit_body[0] = list + delta;
+      jit_body[1] = lock + delta;
+      jit_body[2] = (unsigned long)curr->prog;
+      jit_body[3] = curr->jited_len;
+      int err = ioctl(fd, IOCTL_GET_BPF_PROG_BODY, (int *)jit_body);
       if ( err )
       {
         printf("IOCTL_GET_BPF_PROG_BODY failed, error %d (%s)\n", errno, strerror(errno));
         return;
       }
       if ( g_opt_h )
-        HexDump((unsigned char *)l, curr->jited_len);
-      x64_jit_disasm dis((a64)curr->bpf_func, (const char *)l, curr->jited_len);
-      dis.disasm(delta, map_names);
+        HexDump(curr_jit, curr->jited_len);
+      x64_jit_disasm dis((a64)curr->bpf_func, (const char *)curr_jit, curr->jited_len);
+      dis.disasm(delta, map_names, &holes);
+      dump_holes((const char *)curr_jit, &holes);
     }
     if ( curr->len )
     {
@@ -1071,6 +1445,49 @@ void dump_bpf_progs(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std
       if ( g_dump_bpf_ops )
         HexDump((unsigned char *)l, curr->len * 8);
       ebpf_disasm((unsigned char *)l, curr->len, stdout);
+      put_orig_jit_addr(curr->bpf_func);
+      if ( jit_body )
+      {
+        jitted_code jc;
+        x64_jit_nops skipper;
+        ujit2mem((unsigned char *)l, curr->len, curr->stack_depth, jc);
+        int orig_skip = skipper.skip((const char *)curr_jit, curr->jited_len);
+        curr_jit += orig_skip;
+        if ( jc.body )
+        {
+          int my_skip = skipper.skip((const char *)jc.body, jc.size);
+          jc.size -= my_skip;
+          jc.body += my_skip;
+        }
+        if ( jc.size != curr->jited_len - orig_skip)
+        {
+          printf("jit id %ld has different length - in kernel %d, jitted %ld\n", idx, curr->jited_len, jc.size);
+          if ( jc.size )
+          {
+            x64_jit_disasm dis((a64)curr->bpf_func, (const char *)jc.body, jc.size);
+            dis.disasm(delta, map_names, NULL);
+          }
+        } else {
+          int patched = 0;
+          std::list<const char *>::iterator hiter = holes.begin();
+          for ( size_t i = 0; i < jc.size; i++ )
+          {
+            if ( jc.body[i] != curr_jit[i] )
+            {
+              patched++;
+              printf(" patched at %p, %X - %X\n", i + orig_skip + (char *)curr->bpf_func, jc.body[i], curr_jit[i]);
+            }
+            if ( hiter != holes.end() && (const char *)(curr_jit + i) == *hiter )
+            {
+              i += 4;
+              ++hiter;
+            }
+          }
+          if ( patched )
+            printf("total %d bytes patched\n", patched);
+        }
+      } else
+        ujit2file(idx, (unsigned char *)l, curr->len, curr->stack_depth);
     }
     printf("\n");
    }
@@ -1197,6 +1614,31 @@ void dump_jit_option(int fd, a64 addr, sa64 delta, const char *fmt)
   printf(fmt, val);
 }
 
+void dump_ftrace_options(int fd, sa64 delta)
+{
+  auto addr = get_addr("ftrace_enabled");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "ftrace_enabled: %d\n");
+  addr = get_addr("ftrace_disabled");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "ftrace_disabled: %d\n");
+  addr = get_addr("last_ftrace_enabled");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "last_ftrace_enabled: %d\n");
+  addr = get_addr("ftrace_profile_enabled");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "ftrace_profile_enabled: %d\n");
+  addr = get_addr("ftrace_graph_active");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "ftrace_graph_active: %d\n");
+  addr = get_addr("ftrace_direct_func_count");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "ftrace_direct_func_count: %d\n");
+  addr = get_addr("ftrace_number_of_groups");
+  if ( addr )
+    dump_jit_option<int>(fd, addr, delta, "ftrace_number_of_groups: %d\n");
+}
+
 void dump_jit_options(int fd, sa64 delta)
 {
   auto addr = get_addr("bpf_jit_enable");
@@ -1214,6 +1656,30 @@ void dump_jit_options(int fd, sa64 delta)
   addr = get_addr("bpf_jit_limit_max");
   if ( addr )
     dump_jit_option<long>(fd, addr, delta, "bpf_jit_limit_max: %ld\n");
+}
+
+void dump_bpf_raw_events(int fd, a64 start, a64 end, sa64 delta)
+{
+  if ( !start )
+  {
+    printf("cannot find __start__bpf_raw_tp\n");
+    return;
+  }
+  if ( !end )
+  {
+    printf("cannot find __stop__bpf_raw_tp\n");
+    return;
+  }
+  dump_data2arg<one_bpf_raw_event>(fd, start, end, delta, IOCTL_GET_BPF_RAW_EVENTS, "bpf_raw_tps", "IOCTL_GET_BPF_RAW_EVENTS", "bpf_raw_tps",
+   [=](size_t idx, const one_bpf_raw_event *curr) {
+     printf(" [%ld] num_args %d ", idx, curr->num_args);
+     dump_kptr2((unsigned long)curr->addr, "addr", delta);
+     if ( curr->tp )
+       dump_kptr((unsigned long)curr->tp, "  tp", delta);
+     if ( curr->func )
+       dump_kptr((unsigned long)curr->func, "  func", delta);
+   }
+  );
 }
 
 void dump_bpf_maps(int fd, a64 list, a64 lock, sa64 delta, std::map<void *, std::string> &map_names)
@@ -1444,6 +1910,7 @@ void dump_groups(int fd, sa64 delta)
 
 void dump_uprobes(int fd, sa64 delta)
 {
+  unsigned long ud = get_addr("uprobe_dispatcher");
   unsigned long a1 = get_addr("uprobes_tree");
   if ( !a1 )
   {
@@ -1486,8 +1953,8 @@ void dump_uprobes(int fd, sa64 delta)
   one_uprobe *up = (one_uprobe *)(buf + 1);
   for ( auto cnt = 0; cnt < buf[0]; cnt++ )
   {
-      printf("[%d] addr %p inode %p ino %ld clnts %ld offset %lX flags %lX %s\n", 
-        cnt, up[cnt].addr, up[cnt].inode, up[cnt].i_no, up[cnt].cons_cnt, up[cnt].offset, up[cnt].flags, up[cnt].name);
+      printf("[%d] addr %p inode %p ino %ld clnts %ld offset %lX ref_ctr_offset %lX flags %lX %s\n", 
+        cnt, up[cnt].addr, up[cnt].inode, up[cnt].i_no, up[cnt].cons_cnt, up[cnt].offset, up[cnt].ref_ctr_offset, up[cnt].flags, up[cnt].name);
       if ( !up[cnt].cons_cnt )
         continue;
       size_t client_size = calc_data_size<one_uprobe_consumer>(up[cnt].cons_cnt);
@@ -1520,6 +1987,32 @@ void dump_uprobes(int fd, sa64 delta)
           dump_kptr((unsigned long)uc[cnt2].ret_handler, "  ret_handler", delta);
         if ( uc[cnt2].filter )
           dump_kptr((unsigned long)uc[cnt2].filter, "  filter", delta);
+        if ( !ud )
+          continue;
+        if ( (unsigned long)uc[cnt2].handler != ud + delta )
+          continue;
+#ifdef _DEBUG
+        printf("IOCTL_TRACE_UPROBE required\n");
+#endif /* _DEBUG */
+        size_t ut_size = sizeof(one_trace_event_call);
+        if ( ut_size < 4 * sizeof(unsigned long) )
+          ut_size = 4 * sizeof(unsigned long);
+        unsigned long *cbuf = (unsigned long *)malloc(ut_size);
+        if ( !cbuf )
+          continue;
+        dumb_free<unsigned long> tmp3(cbuf);
+        cbuf[0] = a1 + delta;
+        cbuf[1] = a2 + delta;
+        cbuf[2] = (unsigned long)up[cnt].addr;
+        cbuf[3] = (unsigned long)uc[cnt2].addr;
+        err = ioctl(fd, IOCTL_TRACE_UPROBE, (int *)cbuf);
+        if ( err )
+        {
+          printf("IOCTL_TRACE_UPROBE for %p failed, error %d (%s)\n", up[cnt].addr, errno, strerror(errno));
+          continue;
+        }
+        uprobe_args ua { a1 + delta, a2 + delta, (unsigned long)up[cnt].addr, (unsigned long)uc[cnt2].addr };
+        dump_trace_event_call(fd, cnt2, (one_trace_event_call *)cbuf, delta, &ua);
       }
   }
 }
@@ -2378,6 +2871,24 @@ void dump_super_blocks(int fd, sa64 delta)
   }
 }
 
+int patch_kprobe(int fd, unsigned long a1, unsigned long a2, int idx, void *addr, int action)
+{
+  unsigned long args[5] = { a1, a2, (unsigned long)idx, (unsigned long)addr, (unsigned long)action };
+  int err = ioctl(fd, IOCTL_KPROBE_DISABLE, (int *)&args);
+  if ( err )
+  {
+    printf("IOCTL_KPROBE_DISABLE(%p) failed, error %d (%s)\n", addr, errno, strerror(errno));
+    return -1;
+  }
+  if ( args[0] )
+  {
+    printf("found\n");
+    return 1;
+  }
+  printf("not found\n");
+  return 0;
+}
+
 void dump_kprobes(int fd, sa64 delta)
 {
   unsigned long a1 = get_addr("kprobe_table");
@@ -2439,13 +2950,110 @@ void dump_kprobes(int fd, sa64 delta)
     {
       if ( kp[idx].is_aggr )
         printf(" kprobe at %p flags %X aggregated\n", kp[idx].kaddr, kp[idx].flags);
-      else
-        printf(" kprobe at %p flags %X\n", kp[idx].kaddr, kp[idx].flags);
+      else {
+        if ( kp[idx].is_retprobe )
+          printf(" kprobe at %p flags %X retprobe\n", kp[idx].kaddr, kp[idx].flags);
+        else
+          printf(" kprobe at %p flags %X\n", kp[idx].kaddr, kp[idx].flags);
+        auto is_d = g_kpd.find((unsigned long)kp[idx].kaddr);
+        if ( is_d != g_kpd.end() )
+        {
+          printf("disable kprobe: ");
+          patch_kprobe(fd, a1 + delta, a2 + delta, i, kp[idx].kaddr, 0);
+        }  
+        auto is_e = g_kpe.find((unsigned long)kp[idx].kaddr);
+        if ( is_e != g_kpe.end() )
+        {
+          printf("enable kprobe: ");
+          patch_kprobe(fd, a1 + delta, a2 + delta, i, kp[idx].kaddr, 1);
+        }  
+      }
       dump_kptr((unsigned long)kp[idx].addr, " addr", delta);
       if ( kp[idx].pre_handler )
         dump_kptr((unsigned long)kp[idx].pre_handler, " pre_handler", delta);
       if ( kp[idx].post_handler )
         dump_kptr((unsigned long)kp[idx].post_handler, " post_handler", delta);
+      if ( kp[idx].fault_handler )
+        dump_kptr((unsigned long)kp[idx].fault_handler, " fault_handler", delta);
+      if ( kp[idx].is_retprobe )
+      {
+        if ( kp[idx].kret_handler )
+          dump_kptr((unsigned long)kp[idx].kret_handler, " kret_handler", delta);
+        if ( kp[idx].kret_entry_handler )
+          dump_kptr((unsigned long)kp[idx].kret_entry_handler, " kret_entry_handler", delta);
+      }
+      // dump aggregated kprobes
+      if ( kp[idx].is_aggr )
+      {
+        unsigned long cbuf[5] = { 
+          a1 + delta,
+          a2 + delta,
+          (unsigned long)i,
+          (unsigned long)kp[idx].kaddr,
+          0
+        };
+        err = ioctl(fd, IOCTL_GET_AGGR_KPROBE, (int *)cbuf);
+        if ( err )
+        {
+          printf("IOCTL_GET_AGGR_KPROBE cnt for %p failed, error %d (%s)\n", kp[idx].kaddr, errno, strerror(errno));
+          continue;
+        }
+        if ( !cbuf[0] )
+          continue;
+        printf("  %ld aggregated kprobes:\n", cbuf[0]);
+        auto isize = calc_data_size<one_kprobe>(cbuf[0]);
+        unsigned long *ibuf = (unsigned long *)malloc(isize);
+        if ( !ibuf )
+          continue;
+        dumb_free<unsigned long> itmp(ibuf);
+        // fill params for real aggregated kprobes extracting
+        ibuf[0] = a1 + delta;
+        ibuf[1] = a2 + delta;
+        ibuf[2] = (unsigned long)i;
+        ibuf[3] = (unsigned long)kp[idx].kaddr;
+        ibuf[4] = cbuf[0];
+        err = ioctl(fd, IOCTL_GET_AGGR_KPROBE, (int *)ibuf);
+        if ( err )
+        {
+          printf("IOCTL_GET_AGGR_KPROBE for %p failed, error %d (%s)\n", kp[idx].kaddr, errno, strerror(errno));
+          continue;
+        }
+        auto agsize = ibuf[0];
+        struct one_kprobe *kp = (struct one_kprobe *)(ibuf + 1);
+        for ( size_t idx2 = 0; idx2 < agsize; idx2++ )
+        {
+          printf("  [%ld] at %p", idx2, kp[idx2].kaddr);
+          if ( kp[idx2].is_retprobe )
+            printf(" kretprobe");
+          printf("\n");
+          auto is_d = g_kpd.find((unsigned long)kp[idx2].kaddr);
+          if ( is_d != g_kpd.end() )
+          {
+            printf("disable kprobe: ");
+            patch_kprobe(fd, a1 + delta, a2 + delta, i, kp[idx2].kaddr, 0);
+          }  
+          auto is_e = g_kpe.find((unsigned long)kp[idx2].kaddr);
+          if ( is_e != g_kpe.end() )
+          {
+            printf("enable kprobe: ");
+            patch_kprobe(fd, a1 + delta, a2 + delta, i, kp[idx2].kaddr, 1);
+          }  
+
+          if ( kp[idx2].pre_handler )
+            dump_kptr((unsigned long)kp[idx2].pre_handler, "    pre_handler", delta);
+          if ( kp[idx2].post_handler )
+            dump_kptr((unsigned long)kp[idx2].post_handler, "    post_handler", delta);
+          if ( kp[idx2].fault_handler )
+            dump_kptr((unsigned long)kp[idx2].fault_handler, "    fault_handler", delta);
+          if ( kp[idx2].is_retprobe )
+          {
+            if ( kp[idx2].kret_handler )
+              dump_kptr((unsigned long)kp[idx2].kret_handler, "    kret_handler", delta);
+            if ( kp[idx2].kret_entry_handler )
+              dump_kptr((unsigned long)kp[idx2].kret_entry_handler, "    kret_entry_handler", delta);
+          }
+        }
+      }
     }
   }
   if ( buf != NULL )
@@ -2463,6 +3071,69 @@ void install_urn(int fd, int action)
 static size_t calc_urntfy_size(size_t n)
 {
   return (n + 1) * sizeof(unsigned long);
+}
+
+static size_t calc_freq_ntfy_size(size_t n)
+{
+  if ( n < 2 )
+    return 3 * sizeof(unsigned long);
+  return (n + 1) * sizeof(unsigned long);
+}
+
+void dump_freq_ntfy(int fd, const char *pfx, unsigned long *buf, sa64 delta)
+{
+  int err = ioctl(fd, READ_CPUFREQ_NTFY, buf);
+  if ( err )
+  {
+    fprintf(stderr, "dump_freq_ntfy for %s failed, error %d (%s)\n", pfx, err, strerror(err));
+    return;
+  }
+  for ( size_t i = 0; i < buf[0]; i++ )
+  {
+    printf(" %s[%ld]", pfx, i);
+    dump_unnamed_kptr(buf[i+1], delta);
+  }
+}
+
+void dump_freq_ntfy(int fd, sa64 delta)
+{
+  int cpu_num = get_nprocs();
+  unsigned long arg[3];
+  for ( int i = 0; i < cpu_num; i++ )
+  {
+    arg[0] = i;
+    int err = ioctl(fd, READ_CPUFREQ_CNT, (int *)&arg);
+    if ( err )
+    {
+      printf("dump_freq_ntfy count for cpu_id %d failed, error %d (%s)\n", i, errno, strerror(errno));
+      break;
+    }
+    printf("cpufreq_policy[%d] at %p min_cnt %ld max_cnt %ld\n", i, (void *)arg[0], arg[1], arg[2]);
+    if ( !arg[1] && !arg[2] )
+      continue;
+    size_t cnt_size = calc_freq_ntfy_size(std::max(arg[1], arg[2]));
+    unsigned long *buf = (unsigned long *)malloc(cnt_size);
+    if ( !buf )
+    {
+      printf("cannot alloc %ld bytes of memory for cpufreq_policy[%d]\n", cnt_size, i);
+      continue;
+    }
+    dumb_free<unsigned long> tmp(buf);
+    if ( arg[1] )
+    {
+      buf[0] = i;
+      buf[1] = arg[1];
+      buf[2] = 0;
+      dump_freq_ntfy(fd, "min", buf, delta);
+    }
+    if ( arg[2] )
+    {
+      buf[0] = i;
+      buf[1] = arg[2];
+      buf[2] = 1;
+      dump_freq_ntfy(fd, "max", buf, delta);
+    }
+  }
 }
 
 void dump_return_notifier_list(int fd, unsigned long this_off, unsigned long off, sa64 delta)
@@ -2672,6 +3343,143 @@ void check_tracepoints(int fd, sa64 delta, addr_sym *tsyms, size_t tcount)
   }
   free(ntfy);
 }
+
+void dunp_kalarms(int fd, sa64 delta)
+{
+  for ( int i = 0; i < 2; ++i )
+  {
+    unsigned long params[3] = { (unsigned long)i, 0, 0 };
+    int err = ioctl(fd, IOCTL_GET_ALARMS, (int *)&params);
+    if ( err )
+    {
+      printf("error %d while read IOCTL_GET_ALARMS %d cnt\n", err, i);
+      continue;
+    }
+    printf("kalarms %d: cnt %ld\n", i, params[0]);
+    if ( params[1] )
+      dump_kptr(params[1], " get_ktime", delta);
+    if ( params[2] )
+      dump_kptr(params[2], " get_timespec", delta);
+    if ( !params[0] )
+      continue;
+    size_t size = calc_data_size<one_alarm>(params[0]);
+    unsigned long *buf = (unsigned long *)malloc(size);
+    if ( !buf )
+    {
+      printf("cannot alloc buffer for kalarmss, len %lX\n", size);
+      continue;
+    }
+    dumb_free<unsigned long> tmp(buf);
+    // fill params
+    buf[0] = (unsigned long)i;
+    buf[1] = params[0];
+    err = ioctl(fd, IOCTL_GET_ALARMS, (int *)buf);
+    if ( err )
+    {
+      printf("error %d while read IOCTL_GET_ALARMS %d\n", err, i);
+      continue;
+    }
+    one_alarm *k = (one_alarm *)(buf + 1);
+    for ( unsigned long l = 0; l < buf[0]; ++k, ++l )
+    {
+      printf(" %p\n", k->addr);
+      if ( k->hr_timer )
+        dump_kptr((unsigned long)k->hr_timer, " hr_timer", delta);
+      if ( k->func )
+        dump_kptr((unsigned long)k->func, " func", delta);
+    }
+  }
+}
+
+size_t calc_tsize(unsigned long c)
+{
+  return sizeof(unsigned long) + c * sizeof(ktimer);
+}
+
+void dump_ktimers(int fd, a64 off, a64 poff, sa64 delta)
+{
+  if ( !poff )
+  {
+    printf("cannot find __per_cpu_offset\n");
+    return;
+  }
+  int cpu_num = get_nprocs();
+  int i;
+  // fill per_cpu offsets
+  unsigned long *per = (unsigned long *)calloc(cpu_num, sizeof(unsigned long));
+  if ( NULL == per )
+  {
+    printf("cannot alloc per-cpu array\n");
+    return;
+  }
+  dumb_free<unsigned long> ptmp { per };
+  poff += delta;
+  printf("__per_cpu_offset at %p\n", (void *)poff);
+  for ( i = 0; i < cpu_num; i++ )
+  {
+    unsigned long addr = poff + i * sizeof(unsigned long);
+    int err = ioctl(fd, IOCTL_READ_PTR, (int *)&addr);
+    if ( err )
+    {
+      printf("error %d while read per_cpu %d\n", err, i);
+      continue;
+    }
+    per[i] = addr;
+    printf("per_cpu[%d]: %p\n", i, (void *)per[i] ); 
+  }
+  unsigned long tmax = 0;
+  for ( i = 0; i < cpu_num; i++ )
+  {
+    if ( !per[i] )
+      continue;
+    unsigned long par[2] = { per[i] + off, 0 };
+    int err = ioctl(fd, IOCTL_GET_KTIMERS, (int *)par);
+    if ( err )
+    {
+      printf("error %d while read timers count for cpu %d\n", err, i);
+      continue;
+    }
+    if ( par[0] > tmax )
+      tmax = par[0];
+  }
+  if ( !tmax )
+    return;
+  // alloc enough memory
+#ifdef _DEBUG
+  printf("tmax %ld\n", tmax);
+#endif  
+  size_t tsize = calc_tsize(tmax);
+  unsigned long *buf = (unsigned long *)malloc(tsize);
+  if ( !buf )
+  {
+    printf("cannot alloc buffer for timers, len %lX\n", tsize);
+    return;
+  }
+  dumb_free<unsigned long> tmp(buf);
+  for ( i = 0; i < cpu_num; i++ )
+  {
+    if ( !per[i] )
+      continue;
+    buf[0] = per[i] + off;
+    buf[1] = tmax;
+    int err = ioctl(fd, IOCTL_GET_KTIMERS, (int *)buf);
+    if ( err )
+    {
+      printf("error %d while read timers for cpu %d\n", err, i);
+      continue;
+    }
+    ktimer *k = (ktimer *)(buf + 1);
+    printf("timers for cpu %d %ld:\n", i, buf[0]);
+    for ( unsigned long l = 0; l < buf[0]; ++k, ++l )
+    {
+      if ( k->wq_addr )
+        printf(" %p wq %p flags %X %p", k->addr, k->wq_addr, k->flags, k->func);
+      else
+        printf(" %p flags %X %p", k->addr, k->flags, k->func);
+      dump_unnamed_kptr((unsigned long)k->func, delta);
+    }
+  }
+}
 #endif /* !_MSC_VER */
 
 int is_nop(unsigned char *body)
@@ -2712,25 +3520,77 @@ int main(int argc, char **argv)
        opt_g = 0,
        opt_d = 0,
        opt_c = 0,
+       opt_C = 0,
        opt_k = 0,
        opt_n = 0,
        opt_r = 0,
        opt_s = 0,
        opt_S = 0,
        opt_t = 0,
+       opt_T = 0,
        opt_b = 0,
        opt_B = 0,
        opt_u = 0;
    int c;
    int fd = 0;
+   std::map<unsigned long, unsigned char> patches;
    while (1)
    {
-     c = getopt(argc, argv, "BbcdFfghHknrSstuv");
+     if ( !strcmp(argv[optind],"-kp") )
+     {
+       optind++;
+       if ( optind >= argc )
+         usage(argv[0]);
+       char *unused;
+       unsigned long v = strtoul(argv[optind], &unused, 16);
+       if ( !v )
+         usage(argv[0]);
+       optind++;
+       if ( optind >= argc )
+         usage(argv[0]);
+       unsigned long value = strtoul(argv[optind], &unused, 16);
+       patches[v] = (unsigned char)(value & 0xff);
+       optind++;
+       continue;
+     }
+     if ( !strcmp(argv[optind],"-kpd") )
+     {
+       optind++;
+       if ( optind >= argc )
+         usage(argv[0]);
+       char *unused;
+       unsigned long v = strtoul(argv[optind], &unused, 16);
+       if ( !v )
+         usage(argv[0]);
+       g_kpd.insert(v);
+       optind++;
+       continue;
+     }
+     if ( !strcmp(argv[optind],"-kpe") )
+     {
+       optind++;
+       if ( optind >= argc )
+         usage(argv[0]);
+       char *unused;
+       unsigned long v = strtoul(argv[optind], &unused, 16);
+       if ( !v )
+         usage(argv[0]);
+       g_kpe.insert(v);
+       optind++;
+       continue;
+     }
+     c = getopt(argc, argv, "BbCcdFfghHknrSstTuvj:");
      if (c == -1)
-	break;
+      break;
 
      switch (c)
      {
+#ifndef _MSC_VER
+        case 'j':
+          if ( !ujit_open(optarg) )
+           fprintf(stderr, "cannot dlopen %s, err %d\n", optarg, errno);
+         break;
+#endif /* _MSC_VER */
         case 'B':
           opt_B = 1;
          break;
@@ -2758,6 +3618,9 @@ int main(int argc, char **argv)
         case 'd':
           opt_d = 1;
          break;
+        case 'C':
+          opt_C = 1;
+         break;
         case 'c':
           opt_c = 1;
          break;
@@ -2784,6 +3647,9 @@ int main(int argc, char **argv)
          break;
         case 't':
           opt_t = 1;
+         break;
+        case 'T':
+          opt_T = 1;
          break;
         default:
          usage(argv[0]);
@@ -2874,6 +3740,11 @@ int main(int argc, char **argv)
          printf("delta: %lX\n", delta);
        }
      }
+     if ( opt_c && !patches.empty() )
+        patch_kernel(fd, patches);
+     // dump consoles
+     if ( opt_c && opt_C )
+       dump_consoles(fd, delta);
      // dump kprobes
      if ( opt_k && opt_c )
      {
@@ -3081,6 +3952,20 @@ end:
            dump_efivars(fd, addr, delta);
 #endif /* !_MSC_VER */
        }
+       if ( opt_T && has_syms )
+       {
+         a64 off = (a64)get_addr("timer_bases");
+         if ( off )
+         {
+          printf("timer_bases %p\n", (void *)off);
+          if ( opt_c )
+          {
+            a64 poff = (a64)get_addr("__per_cpu_offset");
+            dump_ktimers(fd, off, poff, delta);
+          }  
+         }
+         dunp_kalarms(fd, delta);
+       }
        if ( opt_t && has_syms )
        {
          size_t tcount = 0;
@@ -3101,6 +3986,16 @@ end:
 #endif /* _MSC_VER */
            free(tsyms);
          }
+         dump_ftrace_options(fd, delta);
+         // dump bpf raw events
+         auto start = get_addr("__start__bpf_raw_tp");
+         auto end   = get_addr("__stop__bpf_raw_tp");
+         dump_bpf_raw_events(fd, start, end, delta);
+         // dump ftrace_ops
+         auto fops = get_addr("ftrace_ops_list");
+         auto m = get_addr("ftrace_lock");
+         dump_ftrace_ops(fd, fops, m, delta);
+         // dump ftrace events
          auto ev_start = get_addr("__start_ftrace_events");
          auto ev_stop  = get_addr("__stop_ftrace_events");
          if ( !ev_start )
@@ -3135,6 +4030,9 @@ end:
 #ifndef _MSC_VER
          if ( opt_c )
          {
+           auto idr = get_addr("pmu_idr");
+           auto m = get_addr("pmus_lock");
+           dump_pmus(fd, idr, m, delta);
            // registered trace_event_calls
            dump_registered_trace_event_calls(fd, delta);
            // event cmds
@@ -3153,6 +4051,10 @@ end:
            ecl = get_addr("dyn_event_ops_list");
            ecm = get_addr("dyn_event_ops_mutex");
            dump_dynevents_ops(fd, ecl, ecm, delta);
+           // dump dynamic events
+           ecl = get_addr("dyn_event_list");
+           ecm = get_addr("event_mutex");
+           dump_dynamic_events(fd, ecl, ecm, delta);
          }
 #endif /* _MSC_VER */
        }
@@ -3182,6 +4084,14 @@ end:
        // dump or check collected addresses
        if ( g_opt_v || opt_c )
          dump_and_check(fd, opt_c, delta, has_syms, filled);
+#ifndef _MSC_VER
+       if ( opt_c )
+       {
+         dump_freq_ntfy(fd, delta);
+         dump_clk_ntfy(fd, get_addr("clk_notifier_list"), get_addr("prepare_lock"), delta);
+         dump_devfreq_ntfy(fd, get_addr("devfreq_list"), get_addr("devfreq_list_lock"), delta);
+       }
+#endif
        if ( opt_d )
        {
           dis_base *bd = NULL;
@@ -3234,6 +4144,8 @@ end:
           }
           if ( opt_B || opt_t )
           {
+            // read bpf_protos
+            check_bpf_protos(fd, delta);
             // find bpf targets
             auto entry = get_addr("bpf_iter_reg_target");
             auto mlock = get_addr("mutex_lock");
@@ -3255,7 +4167,22 @@ end:
                auto entry = get_addr("map_idr");
                tgm = get_addr("map_idr_lock");
                dump_bpf_maps(fd, entry, tgm, delta, names);
+               // bpf ksyms
+               entry = get_addr("bpf_kallsyms");
+               tgm = get_addr("bpf_lock");
+               dump_bpf_ksyms(fd, entry, tgm, delta);
                // bpf progs
+               if ( ujit_opened() )
+               {
+                 a64 base = get_addr("__bpf_call_base");
+                 a64 enter = get_addr("__bpf_prog_enter");
+                 a64 ex = get_addr("__bpf_prog_exit");
+                 if ( base && enter && ex )
+                 {
+                   printf("__bpf_call_base %lX\n", base + delta);
+                   put_kdata(base + delta, enter + delta, ex + delta);
+                 }
+               }
                entry = get_addr("prog_idr");
                tgm = get_addr("prog_idr_lock");
                dump_bpf_progs(fd, entry, tgm, delta, names);
@@ -3418,5 +4345,6 @@ end:
 #ifndef _MSC_VER
    if ( fd )
      close(fd);
+   ujit_close();
 #endif /* _MSC_VER */
 }

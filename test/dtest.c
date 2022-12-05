@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
-#include <linux/getlink.h>
+#include <linux/genetlink.h>
 #include <net/if.h>
 #include "shared.h"
 #include "kmods.h"
@@ -32,7 +32,7 @@ struct chains
 };
 
 // registered with blocking_notifier_chain_register
-static const struct chains s_chains[] = {
+static const struct chains b_chains[] = {
  { "backlight_register_notifier", "backlight_notifier" },
  { "register_tracepoint_module_notifier", "tracepoint_notify_list" },
  { "pm_qos_add_notifier", "pm_qos_array" },
@@ -53,10 +53,17 @@ static const struct chains s_chains[] = {
  { "register_acpi_notifier", "acpi_chain_head" },
  { "acpi_lid_notifier_register", "acpi_lid_notifier" },
  { "register_acpi_hed_notifier", "acpi_hed_notify_list" },
- { "unregister_xenstore_notifier", "xenstore_chain" },
+ { "register_xenstore_notifier", "xenstore_chain" },
  { "register_memory_notifier", "memory_chain" },
  { "usb_register_notify", "usb_notifier_list" },
  { "cpufreq_register_notifier", "cpufreq_policy_notifier_list" },
+ { "ghes_register_vendor_record_notifier", "vendor_record_notify_list" },
+ { "nvmem_register_notifier", "nvmem_notifier" },
+ { "netlink_register_notifier", "netlink_chain" },
+ { "register_inetaddr_notifier", "inetaddr_chain" },
+ { "register_switchdev_blocking_notifier", "switchdev_blocking_notif_chain" },
+ { "of_reconfig_notifier_register", "of_reconfig_chain" },
+ { "of_overlay_notifier_register", "overlay_notify_chain" },
 };
 
 // registered with atomic_notifier_chain_register
@@ -73,6 +80,11 @@ static const struct chains a_chains[] = {
  { "register_inet6addr_notifier", "inet6addr_chain" },
  { "register_dcbevent_notifier", "dcbevent_notif_chain" },
  { "register_switchdev_notifier", "switchdev_notif_chain" },
+ { "cpu_pm_register_notifier", "cpu_pm_notifier_chain" },
+ { "register_lsm_notifier", "lsm_notifier_chain" },
+ { "imx_scu_irq_register_notifier", "imx_scu_irq_notifier_chain" },
+ { "pl320_ipc_register_notifier", "ipc_notifier" },
+ { "register_dcbevent_notifier", "dcbevent_notif_chain" },
 };
 
 // registered with srcu_notifier_chain_register
@@ -325,10 +337,10 @@ int main(int argc, char **argv)
   // test chained ntfy (default)
   if ( !opt_s && !opt_t )
   {
-    printf("chained ntfy:\n");
+    printf("srcu chained ntfy:\n");
     dump_chains(fd, srcu_chains, sizeof(srcu_chains) / sizeof(srcu_chains[0]), IOCTL_CNTSNTFYCHAIN, IOCTL_ENUMSNTFYCHAIN);
-    printf("\nsrcu chained ntfy:\n");
-    dump_chains(fd, s_chains, sizeof(s_chains) / sizeof(s_chains[0]), IOCTL_CNTNTFYCHAIN, IOCTL_ENUMNTFYCHAIN);
+    printf("\nchained ntfy:\n");
+    dump_chains(fd, b_chains, sizeof(b_chains) / sizeof(b_chains[0]), IOCTL_CNTNTFYCHAIN, IOCTL_ENUMNTFYCHAIN);
     printf("\natomic chained ntfy:\n");
     dump_chains(fd, a_chains, sizeof(a_chains) / sizeof(a_chains[0]), IOCTL_CNTANTFYCHAIN, IOCTL_ENUMANTFYCHAIN);
   }

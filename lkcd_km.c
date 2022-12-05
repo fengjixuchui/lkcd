@@ -10,20 +10,23 @@
 #include <linux/debugfs.h>
 #include <linux/namei.h>
 #include <linux/kernfs.h>
+#include <linux/console.h>
 #ifdef __x86_64__
 #include <asm/segment.h>
 #include <asm/uaccess.h>
+#endif
 #include <linux/rbtree.h>
 #include <linux/uprobes.h>
 #include <linux/kprobes.h>
-#include "uprobes.h"
-#endif
 #ifdef CONFIG_FSNOTIFY
 #include <linux/fsnotify_backend.h>
 #include <linux/mount.h>
 #include "mnt.h"
 #endif /* CONFIG_FSNOTIFY */
 #include <linux/smp.h>
+#include <linux/cpufreq.h>
+#include <linux/clk.h>
+#include <linux/devfreq.h>
 #include <linux/miscdevice.h>
 #include <linux/notifier.h>
 #ifdef CONFIG_USER_RETURN_NOTIFIER
@@ -34,7 +37,11 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/trace.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,0,0)
+#include <linux/ftrace.h>
+#endif
 #include <linux/trace_events.h>
+#include "uprobes.h"
 #include <linux/tracepoint-defs.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
@@ -50,9 +57,14 @@
 #include <linux/lsm_hooks.h>
 #include <linux/bpf.h>
 #include <linux/filter.h>
+#include <linux/timer.h>
+#include <linux/workqueue.h>
+#include <linux/alarmtimer.h>
+#include "timers.h"
 #include "bpf.h"
 #include "event.h"
 #include "shared.h"
+#include "arm64.bti/arm64bti.h"
 
 MODULE_LICENSE("GPL");
 // Char we show before each debug print
@@ -62,11 +74,14 @@ struct rw_semaphore *s_net = 0;
 rwlock_t *s_dev_base_lock = 0;
 struct sock_diag_handler **s_sock_diag_handlers = 0;
 struct mutex *s_sock_diag_table_mutex = 0;
+struct ftrace_ops *s_ftrace_end = 0;
+void *delayed_timer = 0;
+struct alarm_base *s_alarm = 0;
 
-#ifdef __x86_64__
 #define KPROBE_HASH_BITS 6
 #define KPROBE_TABLE_SIZE (1 << KPROBE_HASH_BITS)
 
+#ifdef __x86_64__
 // asm functions in getgs.asm
 extern void *get_gs(long offset);
 extern void *get_this_gs(long this_cpu, long offset);
@@ -93,7 +108,7 @@ DEFINE_STATIC_CALL(lkcd_lookup_name_sc, lkcd_lookup_name_scinit);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0) && LINUX_VERSION_CODE < KERNEL_VERSION(5,10,0)
 
-static unsigned long lkcd_lookup_name(const char *name)
+unsigned long lkcd_lookup_name(const char *name)
 {
 	unsigned int i = 0, first_space_idx = 0, second_space_idx = 0; /* Read Index and indexes of spaces */
 	struct file *proc_ksyms = NULL;
@@ -223,7 +238,7 @@ static unsigned long lkcd_lookup_name_scinit(const char *name)
 	return 0;
 }
 
-static unsigned long lkcd_lookup_name(const char *name)
+unsigned long lkcd_lookup_name(const char *name)
 {
  return static_call(lkcd_lookup_name_sc)(name);
 }
@@ -247,6 +262,20 @@ static int close_lkcd(struct inode *inode, struct file *file)
   return 0;
 } 
 
+const char *get_ioctl_name(unsigned int num)
+{
+  switch(num)
+  {
+    case IOCTL_GET_BPF_USED_MAPS:
+      return "IOCTL_GET_BPF_USED_MAPS";
+    case IOCTL_GET_BPF_OPCODES:
+      return "IOCTL_GET_BPF_OPCODES";
+    case IOCTL_GET_BPF_PROG_BODY:
+      return "IOCTL_GET_BPF_PROG_BODY";
+  }
+  return "unknown";
+}
+
 // ripped from https://stackoverflow.com/questions/1184274/read-write-files-within-a-linux-kernel-module
 struct file *file_open(const char *path, int flags, int rights, int *err) 
 {
@@ -268,6 +297,7 @@ void file_close(struct file *file)
 
 const struct file_operations *s_dbg_open = 0;
 const struct file_operations *s_dbg_full = 0;
+void *k_pre_handler_kretprobe = 0;
 
 int is_dbgfs(const struct file_operations *in)
 {
@@ -306,6 +336,9 @@ struct mutex *s_bpf_event_mutex = 0;
 struct mutex *s_tracepoints_mutex = 0;
 typedef int (*und_bpf_prog_array_length)(struct bpf_prog_array *progs);
 und_bpf_prog_array_length bpf_prog_array_length_ptr = 0;
+
+typedef void *(*t_patch_text)(void *addr, const void *opcode, size_t len);
+t_patch_text s_patch_text = 0;
 
 #ifdef CONFIG_FSNOTIFY
 typedef struct fsnotify_mark *(*und_fsnotify_first_mark)(struct fsnotify_mark_connector **connp);
@@ -378,7 +411,11 @@ void fill_superblock_marks(struct super_block *sb, void *arg)
         unsigned long index = args->curr[0];
         args->data[index].mark_addr = (void *)mark;
         args->data[index].mask = mark->mask;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,0,0)        
         args->data[index].ignored_mask = mark->ignored_mask;
+#else
+        args->data[index].ignored_mask = mark->ignore_mask;
+#endif        
         args->data[index].flags = mark->flags;
         if ( mark->group )
         {
@@ -425,7 +462,11 @@ void fill_mount_marks(struct super_block *sb, void *arg)
         unsigned long index = args->curr[0];
         args->data[index].mark_addr = (void *)mark;
         args->data[index].mask = mark->mask;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,0,0)        
         args->data[index].ignored_mask = mark->ignored_mask;
+#else
+        args->data[index].ignored_mask = mark->ignore_mask;
+#endif        
         args->data[index].flags = mark->flags;
         if ( mark->group )
         {
@@ -466,7 +507,11 @@ void fill_inode_marks(struct super_block *sb, void *arg)
         unsigned long index = args->curr[0];
         args->data[index].mark_addr = (void *)mark;
         args->data[index].mask = mark->mask;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,0,0)        
         args->data[index].ignored_mask = mark->ignored_mask;
+#else
+        args->data[index].ignored_mask = mark->ignore_mask;
+#endif        
         args->data[index].flags = mark->flags;
         if ( mark->group )
         {
@@ -645,7 +690,7 @@ void fill_super_blocks(struct super_block *sb, void *arg)
   args->curr[0]++;
 }
 
-#ifdef __x86_64__
+#ifdef CONFIG_UPROBES
 // some uprobe functions
 typedef struct und_uprobe *(*find_uprobe)(struct inode *inode, loff_t offset);
 typedef struct und_uprobe *(*get_uprobe)(struct und_uprobe *uprobe);
@@ -660,17 +705,19 @@ struct und_uprobe *my_get_uprobe(struct und_uprobe *uprobe)
 	return uprobe;
 }
 
-#define DEBUGGEE_FILE_OFFSET	0x4710 /* getenv@plt */
- 
 static struct inode *debuggee_inode = NULL;
-static int urn_installed = 0;
-static int test_kprobe_installed = 0;
+#define DEBUGGEE_FILE_OFFSET	0x4710 /* getenv@plt */
 
 // ripped from https://github.com/kentaost/uprobes_sample/blob/master/uprobes_sample.c
 static int uprobe_sample_handler(struct uprobe_consumer *con,
 		struct pt_regs *regs)
 {
-  printk("uprobe handler in PID %d executed, ip = %lx\n", task_pid_nr(current), regs->ip);
+#if defined(CONFIG_ARM64)
+  u64 ip = regs->pc;
+#else
+  u64 ip = regs->ip;
+#endif  
+  printk("uprobe handler in PID %d executed, ip = %lx\n", task_pid_nr(current), (unsigned long)ip);
   return 0;
 }
 
@@ -678,7 +725,12 @@ static int uprobe_sample_ret_handler(struct uprobe_consumer *con,
 					unsigned long func,
 					struct pt_regs *regs)
 {
-  printk("uprobe ret_handler is executed, ip = %lX\n", regs->ip);
+#if defined(CONFIG_ARM64)
+  u64 ip = regs->pc;
+#else
+  u64 ip = regs->ip;
+#endif  
+  printk("uprobe ret_handler is executed, ip = %lX\n", (unsigned long)ip);
   return 0;
 }
 
@@ -686,6 +738,12 @@ static struct uprobe_consumer s_uc = {
 	.handler = uprobe_sample_handler,
 	.ret_handler = uprobe_sample_ret_handler
 };
+#endif /* CONFIG_UPROBES */
+ 
+#ifdef CONFIG_USER_RETURN_NOTIFIER
+static int urn_installed = 0;
+#endif
+static int test_kprobe_installed = 0;
 
 static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -708,10 +766,12 @@ static void handler_post(struct kprobe *p, struct pt_regs *regs,
 #endif
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)
 /*
  * fault_handler: this is called if an exception is generated for any
  * instruction within the pre- or post-handler, or when Kprobes
  * single-steps the probed instruction.
+ * Was removed in kernel 5.14
  */
 static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr)
 {
@@ -720,11 +780,14 @@ static int handler_fault(struct kprobe *p, struct pt_regs *regs, int trapnr)
 	/* Return 0 because we don't handle the fault. */
 	return 0;
 }
+#endif
 
 static struct kprobe test_kp = {
 	.pre_handler = handler_pre,
 	.post_handler = handler_post,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)  
 	.fault_handler = handler_fault,
+#endif
 	.symbol_name	= "__x64_sys_fork", // try better do_int3, he-he
 };
 
@@ -734,6 +797,14 @@ static unsigned long kprobe_aggr = 0;
 int is_krpobe_aggregated(struct kprobe *p)
 {
   return (unsigned long)p->pre_handler == kprobe_aggr;
+}
+
+void patch_kprobe(struct kprobe *p, unsigned long reason)
+{
+  if ( reason )
+    p->flags &= ~KPROBE_FLAG_DISABLED;
+  else
+    p->flags |= KPROBE_FLAG_DISABLED;
 }
 
 #ifdef CONFIG_USER_RETURN_NOTIFIER
@@ -755,6 +826,7 @@ struct urn_params
   unsigned long *out_data;
 };
 
+#ifdef CONFIG_USER_RETURN_NOTIFIER
 static void copy_lrn(void *info)
 {
   struct urn_params *params = (struct urn_params *)info;
@@ -794,7 +866,25 @@ static void count_lrn(void *info)
      buf[1]++;
   }
 }
-#endif /* __x86_64__ */
+#endif /* CONFIG_USER_RETURN_NOTIFIER */
+
+// assumed that all locks was taken before calling of this function
+static unsigned long copy_trace_bpfs(const struct trace_event_call *c, unsigned long lim, unsigned long *out_buf)
+{
+  unsigned long cnt, i;
+  out_buf[0] = 0;
+  if ( !c->prog_array )
+    return 0;
+  cnt = bpf_prog_array_length_ptr(c->prog_array);
+  for ( i = 0; i < cnt; ++i )
+  {
+    if ( i >= lim )
+      return lim;
+    out_buf[i + 1] = (unsigned long)c->prog_array->items[i].prog;
+    out_buf[0]++;
+  }
+  return i;
+}
 
 static void copy_trace_event_call(const struct trace_event_call *c, struct one_trace_event_call *out_data)
 {
@@ -805,6 +895,7 @@ static void copy_trace_event_call(const struct trace_event_call *c, struct one_t
   out_data->filter = (void *)c->filter;
   out_data->flags = c->flags;
   out_data->perf_cnt = 0;
+  out_data->bpf_cnt = 0;
 #ifdef CONFIG_PERF_EVENTS
   out_data->perf_perm = (void *)c->perf_perm;
   if ( c->prog_array )
@@ -865,9 +956,11 @@ void fill_bpf_prog(struct one_bpf_prog *curr, struct bpf_prog *prog)
     curr->used_map_cnt = prog->aux->used_map_cnt;
     curr->used_btf_cnt = prog->aux->used_btf_cnt;
     curr->func_cnt = prog->aux->func_cnt;
+    curr->stack_depth = prog->aux->stack_depth;
+    curr->num_exentries = prog->aux->num_exentries;
   } else {
     curr->aux_id = 0;
-    curr->used_map_cnt = curr->used_btf_cnt = curr->func_cnt = 0;
+    curr->used_map_cnt = curr->used_btf_cnt = curr->func_cnt = curr->stack_depth = curr->num_exentries = 0;
   }
 }
 
@@ -880,9 +973,9 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
     case IOCTL_READ_PTR:
      {
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        if ( copy_to_user((void*)ioctl_param, (void*)ptrbuf[0], sizeof(void *)) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
      }
      break; /* IOCTL_READ_PTR */
 
@@ -901,13 +994,13 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        }
        ptrbuf[0] = lkcd_lookup_name(name);
        if (copy_to_user((void*)ioctl_param, (void*)ptrbuf, sizeof(ptrbuf[0])) > 0)
- 	 return -EFAULT;
+         return -EFAULT;
       }
       break; /* IOCTL_RKSYM */
 
     case IOCTL_GET_NETDEV_CHAIN:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        if ( !ptrbuf[1] )
        {
          unsigned long cnt = 0;
@@ -919,7 +1012,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          rtnl_unlock();
          // copy count to user-mode
          if ( copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0 )
-   	   return -EFAULT;
+           return -EFAULT;
        } else {
          struct notifier_block *b;
          unsigned long cnt = 0;
@@ -946,6 +1039,177 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        }
       break; /* IOCTL_GET_NETDEV_CHAIN */
 
+    case READ_CPUFREQ_NTFY:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+         return -EFAULT;
+        else {
+          struct cpufreq_policy *cf = cpufreq_cpu_get(ptrbuf[0]);
+          struct notifier_block *b;
+          struct blocking_notifier_head *head;
+          unsigned long *out_buf;
+          unsigned long size, i;
+          if ( !cf )
+           return -ENODATA;
+          // cals size
+          size = (1 + ptrbuf[1]) * sizeof(unsigned long);
+          out_buf = (unsigned long *)kmalloc(size, GFP_KERNEL);
+          if ( !out_buf )
+          {
+            cpufreq_cpu_put(cf);  
+            return -ENOMEM;
+          }
+          if ( !ptrbuf[2] )
+            head = &cf->constraints.min_freq_notifiers;
+          else
+            head = &cf->constraints.max_freq_notifiers;
+          down_write(&head->rwsem);
+          out_buf[0] = 0;
+          i = 0;
+          for ( b = head->head; i < ptrbuf[1] && b != NULL; b = b->next, ++i )
+          {
+            out_buf[1 + i] = (unsigned long)b->notifier_call;
+          }
+          up_write(&head->rwsem);
+          cpufreq_cpu_put(cf);
+          out_buf[0] = i;
+          if ( copy_to_user((void*)(ioctl_param), (void*)out_buf, sizeof(unsigned long) * (i + 1)) > 0 )
+          {
+            kfree(out_buf);
+            return -EFAULT;
+          }
+          kfree(out_buf);
+        }
+      break; /* READ_CPUFREQ_NTFY */
+
+    case READ_CPUFREQ_CNT:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
+         return -EFAULT;
+        else {
+         struct cpufreq_policy *cf = cpufreq_cpu_get(ptrbuf[0]);
+         unsigned long out_buf[3] = { 0, 0, 0 };
+         struct notifier_block *b;
+         if ( !cf )
+           return -ENODATA;
+         out_buf[0] = (unsigned long)cf;
+         // count ntfy
+         down_write(&cf->constraints.min_freq_notifiers.rwsem);
+         if ( cf->constraints.min_freq_notifiers.head != NULL )
+         {
+           for ( b = cf->constraints.min_freq_notifiers.head; b != NULL; b = b->next )
+             out_buf[1]++;
+         }  
+         up_write(&cf->constraints.min_freq_notifiers.rwsem);
+         down_write(&cf->constraints.max_freq_notifiers.rwsem);
+         if ( cf->constraints.max_freq_notifiers.head != NULL )
+         {
+           for ( b = cf->constraints.max_freq_notifiers.head; b != NULL; b = b->next )
+             out_buf[2]++;
+         }  
+         up_write(&cf->constraints.max_freq_notifiers.rwsem);
+         cpufreq_cpu_put(cf);
+         if ( copy_to_user((void*)(ioctl_param), (void*)out_buf, sizeof(out_buf)) > 0 )
+           return -EFAULT;
+        }
+      break; /* READ_CPUFREQ_CNT */
+
+    case IOCTL_REM_BNTFY:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+         return -EFAULT;
+        else {
+         struct blocking_notifier_head *nb = (struct blocking_notifier_head *)ptrbuf[9];
+         void *ntfy = (void *)ptrbuf[1];
+         struct notifier_block *b, *target = NULL;
+         // lock
+         down_write(&nb->rwsem);
+         if ( nb->head != NULL )
+         {
+          for ( b = nb->head; b != NULL; b = b->next )
+            if ( ntfy == b->notifier_call )
+            {
+              target = b;
+              break;
+            }
+         }
+         // unlock
+         up_write(&nb->rwsem);
+         if ( target )
+         {
+           blocking_notifier_chain_unregister(nb, target);
+           ptrbuf[0] = 1;
+         } else
+           ptrbuf[0] = 0;
+         // copy result to user-mode
+         if ( copy_to_user((void*)(ioctl_param), (void*)ptrbuf, sizeof(ptrbuf[0])) > 0 )
+           return -EFAULT;
+        }
+      break; /* IOCTL_REM_BNTFY */
+
+    case IOCTL_REM_ANTFY:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+         return -EFAULT;
+        else {
+         struct atomic_notifier_head *nb = (struct atomic_notifier_head *)ptrbuf[9];
+         void *ntfy = (void *)ptrbuf[1];
+         struct notifier_block *b, *target = NULL;
+         unsigned long flags;
+         // lock
+         spin_lock_irqsave(&nb->lock, flags);
+         if ( nb->head != NULL )
+         {
+          for ( b = nb->head; b != NULL; b = b->next )
+            if ( ntfy == b->notifier_call )
+            {
+              target = b;
+              break;
+            }
+         }
+         // unlock
+         spin_unlock_irqrestore(&nb->lock, flags);
+         if ( target )
+         {
+           atomic_notifier_chain_unregister(nb, target);
+           ptrbuf[0] = 1;
+         } else
+           ptrbuf[0] = 0;
+         // copy result to user-mode
+         if ( copy_to_user((void*)(ioctl_param), (void*)ptrbuf, sizeof(ptrbuf[0])) > 0 )
+           return -EFAULT;
+        }
+      break; /* IOCTL_REM_ANTFY */
+
+    case IOCTL_REM_SNTFY:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+         return -EFAULT;
+        else {
+         struct srcu_notifier_head *nb = (struct srcu_notifier_head *)ptrbuf[9];
+         void *ntfy = (void *)ptrbuf[1];
+         struct notifier_block *b, *target = NULL;
+         // lock
+         mutex_lock(&nb->mutex);
+         if ( nb->head != NULL )
+         {
+          for ( b = nb->head; b != NULL; b = b->next )
+            if ( ntfy == b->notifier_call )
+            {
+              target = b;
+              break;
+            }
+         }
+         // unlock
+         mutex_unlock(&nb->mutex);
+         synchronize_srcu(&nb->srcu);
+         if ( target )
+         {
+           srcu_notifier_chain_unregister(nb, target);
+           ptrbuf[0] = 1;
+         } else
+           ptrbuf[0] = 0;
+         // copy result to user-mode
+         if ( copy_to_user((void*)(ioctl_param), (void*)ptrbuf, sizeof(ptrbuf[0])) > 0 )
+           return -EFAULT;
+        }
+      break; /* IOCTL_REM_SNTFY */
+
     case IOCTL_CNTNTFYCHAIN:
      {
        // copy address of blocking_notifier_head from user-mode
@@ -953,7 +1217,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        struct notifier_block *b;
        unsigned long res = 0;
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        nb = (struct blocking_notifier_head *)ptrbuf[0];
        // lock
        down_write(&nb->rwsem);
@@ -967,7 +1231,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        up_write(&nb->rwsem);
        // copy count to user-mode
        if ( copy_to_user((void*)ioctl_param, (void*)&res, sizeof(res)) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
      }
      break; /* IOCTL_CNTNTFYCHAIN */
 
@@ -977,7 +1241,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        struct blocking_notifier_head *nb;
        unsigned long cnt;
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        nb = (struct blocking_notifier_head *)ptrbuf[0];
        cnt = ptrbuf[1];
        // validation
@@ -1030,7 +1294,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        unsigned long cnt;
        unsigned long flags;
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        nb = (struct atomic_notifier_head *)ptrbuf[0];
        cnt = ptrbuf[1];
        // validation
@@ -1084,7 +1348,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        unsigned long flags;
        unsigned long res = 0;
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        nb = (struct atomic_notifier_head *)ptrbuf[0];
        // lock
        spin_lock_irqsave(&nb->lock, flags);
@@ -1098,17 +1362,135 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        spin_unlock_irqrestore(&nb->lock, flags);
        // copy count to user-mode
        if ( copy_to_user((void*)ioctl_param, (void*)&res, sizeof(res)) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
      }
      break; /* IOCTL_CNTANTFYCHAIN */
 
+    case READ_CLK_NTFY:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+         return -EFAULT;
+       else {
+         struct clk_notifier *cn;
+         struct list_head *head = (struct list_head *)ptrbuf[0];
+         struct mutex *m = (struct mutex *)ptrbuf[1];
+         struct notifier_block *b;
+         unsigned long cnt = 0;
+         if ( !ptrbuf[2] )
+         {
+           mutex_lock(m);
+           list_for_each_entry(cn, head, node)
+           {
+             int idx = srcu_read_lock(&cn->notifier_head.srcu);
+             for ( b = cn->notifier_head.head; b != NULL; b = b->next )
+               cnt++;
+             srcu_read_unlock(&cn->notifier_head.srcu, idx);
+           }
+           mutex_unlock(m); 
+           // copy count to user-mode
+           if ( copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0 )
+             return -EFAULT;
+         } else {
+           struct clk_ntfy *curr;
+           unsigned long size = sizeof(unsigned long) + ptrbuf[2] * sizeof(struct clk_ntfy);
+           unsigned long *kbuf = (unsigned long *)kmalloc(size, GFP_KERNEL);
+           if ( !kbuf )
+             return -ENOMEM;
+           curr = (struct clk_ntfy *)(kbuf + 1);
+           mutex_lock(m);
+           list_for_each_entry(cn, head, node)
+           {
+             if ( cnt >= ptrbuf[2] )
+               break;
+             else {
+               int idx = srcu_read_lock(&cn->notifier_head.srcu);
+               for ( b = cn->notifier_head.head; b != NULL && cnt < ptrbuf[2]; b = b->next, ++cnt )
+               {
+                 curr->clk = (unsigned long)cn;
+                 curr->ntfy = (unsigned long)b->notifier_call;
+                 ++curr;
+               }
+               srcu_read_unlock(&cn->notifier_head.srcu, idx);
+             }
+           }
+           mutex_unlock(m);
+           kbuf[0] = cnt; 
+           // copy data to user-mode
+           if ( copy_to_user((void*)ioctl_param, (void*)kbuf, size) > 0 )
+           {
+             kfree(kbuf);
+             return -EFAULT;
+           }
+           kfree(kbuf);
+         }
+       }
+     break; /* READ_CLK_NTFY */
+
+    case READ_DEVFREQ_NTFY:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+         return -EFAULT;
+       else {
+         struct devfreq *cn;
+         struct list_head *head = (struct list_head *)ptrbuf[0];
+         struct mutex *m = (struct mutex *)ptrbuf[1];
+         struct notifier_block *b;
+         unsigned long cnt = 0;
+         if ( !ptrbuf[2] )
+         {
+           mutex_lock(m);
+           list_for_each_entry(cn, head, node)
+           {
+             int idx = srcu_read_lock(&cn->transition_notifier_list.srcu);
+             for ( b = cn->transition_notifier_list.head; b != NULL; b = b->next )
+               cnt++;
+             srcu_read_unlock(&cn->transition_notifier_list.srcu, idx);
+           }
+           mutex_unlock(m); 
+           // copy count to user-mode
+           if ( copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0 )
+             return -EFAULT;
+         } else {
+           struct clk_ntfy *curr;
+           unsigned long size = sizeof(unsigned long) + ptrbuf[2] * sizeof(struct clk_ntfy);
+           unsigned long *kbuf = (unsigned long *)kmalloc(size, GFP_KERNEL);
+           if ( !kbuf )
+             return -ENOMEM;
+           curr = (struct clk_ntfy *)(kbuf + 1);
+           mutex_lock(m);
+           list_for_each_entry(cn, head, node)
+           {
+             if ( cnt >= ptrbuf[2] )
+               break;
+             else {
+               int idx = srcu_read_lock(&cn->transition_notifier_list.srcu);
+               for ( b = cn->transition_notifier_list.head; b != NULL && cnt < ptrbuf[2]; b = b->next, ++cnt )
+               {
+                 curr->clk = (unsigned long)cn;
+                 curr->ntfy = (unsigned long)b->notifier_call;
+                 ++curr;
+               }
+               srcu_read_unlock(&cn->transition_notifier_list.srcu, idx);
+             }
+           }
+           mutex_unlock(m);
+           kbuf[0] = cnt; 
+           // copy data to user-mode
+           if ( copy_to_user((void*)ioctl_param, (void*)kbuf, size) > 0 )
+           {
+             kfree(kbuf);
+             return -EFAULT;
+           }
+           kfree(kbuf);
+         }
+       }
+     break; /* READ_DEVFREQ_NTFY */
+
     case IOCTL_ENUMSNTFYCHAIN:
      {
-       // copy address of srcu_notifier_head and count from user-mode
+       // copy args from user-mode
        struct srcu_notifier_head *nb;
        unsigned long cnt;
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
- 	 return -EFAULT;
+         return -EFAULT;
        nb = (struct srcu_notifier_head *)ptrbuf[0];
        cnt = ptrbuf[1];
        // validation
@@ -1656,7 +2038,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
 
 #endif /* CONFIG_FSNOTIFY */
 
-#ifdef __x86_64__
+// #ifdef __x86_64__
      case IOCTL_CNT_UPROBES:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
          return -EFAULT;
@@ -1678,6 +2060,96 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        }
        break; /* IOCTL_CNT_UPROBES */
 
+     case IOCTL_TRACE_UPROBE_BPFS:
+        if ( !bpf_prog_array_length_ptr )
+          return -ENOCSI;
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 5) > 0 )
+          return -EFAULT;
+        else {
+          struct rb_root *root = (struct rb_root *)ptrbuf[0];
+          spinlock_t *lock = (spinlock_t *)ptrbuf[1];
+          struct trace_uprobe *tup = NULL;
+          struct rb_node *iter;
+          unsigned long kbuf_size = (1 + ptrbuf[4]) * sizeof(unsigned long);
+          unsigned long *buf = (unsigned long *)kzalloc(kbuf_size, GFP_KERNEL | __GFP_ZERO);
+          if ( !buf )
+            return -ENOMEM;
+          // lock
+          spin_lock(lock);
+          for ( iter = rb_first(root); iter != NULL; iter = rb_next(iter) )
+          {
+            struct uprobe_consumer *con;
+            struct und_uprobe *up = rb_entry(iter, struct und_uprobe, rb_node);
+            if ( (unsigned long)up != ptrbuf[2] )
+              continue;
+            down_write(&up->consumer_rwsem);
+            for (con = up->consumers; con; con = con->next )
+            {
+              if ( (unsigned long)con != ptrbuf[3] )
+                continue;
+              tup = container_of(con, struct trace_uprobe, consumer);
+              break;
+            }
+            if ( tup != NULL )
+              copy_trace_bpfs(&tup->tp.event->call, ptrbuf[4], buf);
+            up_write(&up->consumer_rwsem);
+            break;
+          }
+          // unlock
+          spin_unlock(lock);
+          if ( tup == NULL )
+            return -ENOENT;
+          // copy to usermode
+          if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+          {
+            kfree(buf);
+            return -EFAULT;
+          }
+          kfree(buf);
+        }
+       break; /* IOCTL_TRACE_UPROBE_BPFS */
+
+     case IOCTL_TRACE_UPROBE:
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 4) > 0 )
+          return -EFAULT;
+        else {
+          struct rb_root *root = (struct rb_root *)ptrbuf[0];
+          spinlock_t *lock = (spinlock_t *)ptrbuf[1];
+          struct trace_uprobe *tup = NULL;
+          struct rb_node *iter;
+          struct one_trace_event_call buf;
+          // lock
+          spin_lock(lock);
+          for ( iter = rb_first(root); iter != NULL; iter = rb_next(iter) )
+          {
+            struct uprobe_consumer *con;
+            struct und_uprobe *up = rb_entry(iter, struct und_uprobe, rb_node);
+            if ( (unsigned long)up != ptrbuf[2] )
+              continue;
+            down_write(&up->consumer_rwsem);
+            for (con = up->consumers; con; con = con->next )
+            {
+              if ( (unsigned long)con != ptrbuf[3] )
+                continue;
+              tup = container_of(con, struct trace_uprobe, consumer);
+              break;
+            }
+            if ( tup != NULL )
+              copy_trace_event_call(&tup->tp.event->call, &buf);
+            up_write(&up->consumer_rwsem);
+            break;
+          }
+          // unlock
+          spin_unlock(lock);
+          if ( tup == NULL )
+            return -ENOENT;
+          // copy to usermode
+          if (copy_to_user((void*)ioctl_param, (void*)&buf, sizeof(buf)) > 0)
+            return -EFAULT;
+        }
+       break; /* IOCTL_TRACE_UPROBE */
+
+#ifdef CONFIG_UPROBES
      case IOCTL_UPROBES_CONS:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 4) > 0 )
          return -EFAULT;
@@ -1762,6 +2234,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
            struct und_uprobe *up = rb_entry(iter, struct und_uprobe, rb_node);
            curr[cnt].addr = up;
            curr[cnt].inode = up->inode;
+           curr[cnt].ref_ctr_offset = up->ref_ctr_offset;
            curr[cnt].offset = up->offset;
            curr[cnt].i_no = 0;
            curr[cnt].flags = up->flags;
@@ -1817,6 +2290,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          debuggee_inode = 0;
        }
       break; /* IOCTL_TEST_UPROBE */
+#endif /* CONFIG_UPROBES */
 
      case IOCTL_TEST_KPROBE:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
@@ -1839,6 +2313,52 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        }
       break; /* IOCTL_TEST_KPROBE */
 
+     case IOCTL_KPROBE_DISABLE:
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 5) > 0 )
+         return -EFAULT;
+       else {
+         struct hlist_head *head;
+         struct mutex *m = (struct mutex *)ptrbuf[1];
+         struct kprobe *p;
+         long found = 0;
+         if ( ptrbuf[2] >= KPROBE_TABLE_SIZE )
+           return -EFBIG;
+         // lock
+         mutex_lock(m);
+	       head = (struct hlist_head *)ptrbuf[0] + ptrbuf[2];
+         // traverse
+         hlist_for_each_entry(p, head, hlist)
+         {
+           if ( (unsigned long)p != ptrbuf[3] )
+           {
+             struct kprobe *kp;
+             if ( !is_krpobe_aggregated(p) )           
+               continue;
+             list_for_each_entry_rcu(kp, &p->list, list)
+             {
+               if ( (unsigned long)kp == ptrbuf[3] )
+               {
+                 found = 1;
+                 patch_kprobe(kp, ptrbuf[4]);
+                 break;
+               }
+             }
+             if ( found )
+               break;
+           } else {
+             found = 1;
+             patch_kprobe(p, ptrbuf[4]);
+             break;
+           }
+         }
+         // unlock
+         mutex_unlock(m);
+         // copy to user
+         if (copy_to_user((void*)ioctl_param, (void*)&found, sizeof(found)) > 0)
+           return -EFAULT;
+       }
+      break; /* IOCTL_KPROBE_DISABLE */
+
      case IOCTL_CNT_KPROBE_BUCKET:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
          return -EFAULT;
@@ -1849,13 +2369,13 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          if ( ptrbuf[2] >= KPROBE_TABLE_SIZE )
            return -EFBIG;
          // lock
-	 mutex_lock(m);
-	 head = (struct hlist_head *)ptrbuf[0] + ptrbuf[2];
+         mutex_lock(m);
+         head = (struct hlist_head *)ptrbuf[0] + ptrbuf[2];
          ptrbuf[0] = 0;
          // traverse
          hlist_for_each_entry(p, head, hlist)
            ptrbuf[0]++;
-	 // unlock
+         // unlock
          mutex_unlock(m);
          // copy to user
          if (copy_to_user((void*)ioctl_param, (void*)ptrbuf, sizeof(ptrbuf[0])) > 0)
@@ -1881,7 +2401,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          if ( !ptrbuf[4] )
          {
            // lock
-	   mutex_lock(m);
+	         mutex_lock(m);
            // traverse
            hlist_for_each_entry(p, head, hlist)
            {
@@ -1908,20 +2428,20 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
             unsigned long *buf = NULL;
             unsigned long curr = 0;
             kbuf_size = sizeof(unsigned long) + ptrbuf[4] * sizeof(struct one_kprobe);
-            buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL);
+            buf = (unsigned long *)kzalloc(kbuf_size, GFP_KERNEL | __GFP_ZERO);
             if ( !buf )
               return -ENOMEM;
             out_buf = (struct one_kprobe *)(buf + 1);
             // lock
-	    mutex_lock(m);
+	          mutex_lock(m);
             // traverse
             hlist_for_each_entry(p, head, hlist)
             {
               if ( (unsigned long)p != ptrbuf[3] )
                 continue;
-              found++;
               if ( !is_krpobe_aggregated(p) )
                 break;
+              found++;
               // found our aggregated krobe
               list_for_each_entry_rcu(kp, &p->list, list)
               {
@@ -1931,8 +2451,22 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
                 out_buf[curr].addr = (void *)kp->addr;
                 out_buf[curr].pre_handler = (void *)kp->pre_handler;
                 out_buf[curr].post_handler = (void *)kp->post_handler;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)
+                out_buf[curr].fault_handler = (void *)kp->fault_handler;
+#endif
                 out_buf[curr].flags = (unsigned int)kp->flags;
                 out_buf[curr].is_aggr = is_krpobe_aggregated(kp);
+                // check for kretprobe
+                if ( !out_buf[curr].is_aggr && kp->pre_handler == k_pre_handler_kretprobe )
+                {
+                  struct kretprobe *rkp = container_of(kp, struct kretprobe, kp);
+                  out_buf[curr].is_retprobe = 1;
+                  if ( rkp )
+                  {
+                    out_buf[curr].kret_handler = rkp->handler;
+                    out_buf[curr].kret_entry_handler = rkp->entry_handler;
+                  }
+                }
                 curr++;
               }
               break;
@@ -1968,7 +2502,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
            break;
          // alloc enough memory
          kbuf_size = sizeof(unsigned long) + ptrbuf[3] * sizeof(struct one_kprobe);
-         buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL);
+         buf = (unsigned long *)kzalloc(kbuf_size, GFP_KERNEL | __GFP_ZERO);
          if ( !buf )
            return -ENOMEM;
          else {
@@ -1978,8 +2512,8 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
            struct mutex *m = (struct mutex *)ptrbuf[1];
            struct one_kprobe *out_buf = (struct one_kprobe *)(buf + 1);
            // lock
-	   mutex_lock(m);
-	   head = (struct hlist_head *)ptrbuf[0] + ptrbuf[2];
+	         mutex_lock(m);
+	         head = (struct hlist_head *)ptrbuf[0] + ptrbuf[2];
            // traverse
            hlist_for_each_entry(p, head, hlist)
            {
@@ -1989,8 +2523,22 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
              out_buf[curr].addr = (void *)p->addr;
              out_buf[curr].pre_handler = (void *)p->pre_handler;
              out_buf[curr].post_handler = (void *)p->post_handler;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,14,0)
+             out_buf[curr].fault_handler = (void *)p->fault_handler;
+#endif             
              out_buf[curr].flags = (unsigned int)p->flags;
              out_buf[curr].is_aggr = is_krpobe_aggregated(p);
+             // check for kretprobe
+             if ( !out_buf[curr].is_aggr && out_buf[curr].pre_handler == k_pre_handler_kretprobe )
+             {
+                  struct kretprobe *rkp = container_of(p, struct kretprobe, kp);
+                  out_buf[curr].is_retprobe = 1;
+                  if ( rkp )
+                  {
+                    out_buf[curr].kret_handler = rkp->handler;
+                    out_buf[curr].kret_entry_handler = rkp->entry_handler;
+                  }
+             }
              curr++;
            }
            // unlock
@@ -2009,10 +2557,10 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
        }
       break; /* IOCTL_GET_KPROBE_BUCKET */
 
+#ifdef CONFIG_USER_RETURN_NOTIFIER
      case IOCTL_TEST_URN:
        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
          return -EFAULT;
-#ifdef CONFIG_USER_RETURN_NOTIFIER
        if ( ptrbuf[0] && !urn_installed )
        {
          user_return_notifier_register(&s_urn);
@@ -2023,7 +2571,6 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          user_return_notifier_unregister(&s_urn);
          urn_installed = 0;
        }
-#endif /* CONFIG_USER_RETURN_NOTIFIER */
        break; /* IOCTL_TEST_URN */
 
      case IOCTL_CNT_RNL_PER_CPU:
@@ -2031,7 +2578,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
         int err;
         unsigned long cpu_n;
         if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
-  	  return -EFAULT;
+          return -EFAULT;
         cpu_n = ptrbuf[0];
         err = smp_call_function_single(cpu_n, count_lrn, (void*)ptrbuf, 1);
         if ( err )
@@ -2085,7 +2632,72 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
           kfree(params.out_data);
       }
       break; /* IOCTL_RNL_PER_CPU */
-#endif /* __x86_64__ */
+#endif /* CONFIG_USER_RETURN_NOTIFIER */
+
+     case IOCTL_READ_CONSOLES:
+       // read cnt
+       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
+  	      return -EFAULT;
+       if ( !ptrbuf[0] )
+       {
+         // just count amount of registered consoles
+         struct console *con;
+         console_lock();
+         // achtung! don`t try to use printk or something like this until console_unlock call
+         for_each_console(con)
+         {
+          ptrbuf[0]++;
+         }
+         // unlock
+         console_unlock();
+         // copy to user-mode
+         if ( copy_to_user( (void*)ioctl_param, (void*)ptrbuf, sizeof(long)) > 0 )
+  	      return -EFAULT;
+       } else {
+         unsigned long cnt = 0;
+         struct console *con;
+         size_t kbuf_size = sizeof(unsigned long) + ptrbuf[0] * sizeof(struct one_console);
+         struct one_console *curr;
+         unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL | __GFP_ZERO);
+         if ( !buf )
+           return -ENOMEM;
+         curr = (struct one_console *)(buf + 1);
+         console_lock();
+         // achtung! don`t try to use printk or something like this until console_unlock call
+         for_each_console(con)
+         {
+          cnt++;
+          if ( cnt > ptrbuf[0] )
+            break;
+          curr->addr = con;
+          strlcpy(curr->name, con->name, 16);
+          curr->write = con->write;
+          curr->read  = con->read;
+          curr->device = con->device;
+          curr->unblank = con->unblank;
+          curr->setup = con->setup;
+          curr->exit = con->exit;
+          curr->match = con->match;
+          // curr->dropped = con->dropped;
+          curr->flags = con->flags;
+          curr->index = con->index;
+          // curr->cflags = con->cflags;
+          // for next console
+          curr++;
+         }
+         // unlock
+         console_unlock();
+         // copy to user mode
+         buf[0] = cnt;
+         kbuf_size = sizeof(unsigned long) + cnt * sizeof(struct one_console);
+         if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+         {
+           kfree(buf);
+           return -EFAULT;
+         }
+         kfree(buf);
+       }
+       break; /* IOCTL_READ_CONSOLES */
 
      case IOCTL_GET_SOCK_DIAG:
         // check pre-req
@@ -2093,7 +2705,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
           return -ENOCSI;
         // read index
         if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long)) > 0 )
-  	  return -EFAULT;
+  	      return -EFAULT;
   	if ( ptrbuf[0] >= AF_MAX)
           return -EINVAL;
         else {
@@ -2742,6 +3354,88 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
         }
       break; /* IOCTL_DEL_CGROUP_BPF */
 
+    case IOCTL_GET_PMUS:
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+  	  return -EFAULT;
+  	else
+        {
+          struct idr *pmus = (struct idr *)ptrbuf[0];
+          struct mutex *m = (struct mutex *)ptrbuf[1];
+          unsigned int id;
+          struct pmu *pmu;
+          // check cnt
+          if ( !ptrbuf[2] )
+          {
+            ptrbuf[0] = 0;
+            // lock
+            mutex_lock(m);
+            // iterate
+            idr_for_each_entry(pmus, pmu, id)
+              ptrbuf[0]++;
+            // unlock
+            mutex_unlock(m);
+            if (copy_to_user((void*)ioctl_param, (void*)ptrbuf, sizeof(ptrbuf[0])) > 0)
+              return -EFAULT;
+          } else {
+            unsigned long cnt = 0;
+            size_t kbuf_size = sizeof(unsigned long) + ptrbuf[2] * sizeof(struct one_pmu);
+            struct one_pmu *curr;
+            unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL  | __GFP_ZERO);
+            if ( !buf )
+              return -ENOMEM;
+            curr = (struct one_pmu *)(buf + 1);
+            // lock
+            mutex_lock(m);
+            // iterate
+            idr_for_each_entry(pmus, pmu, id)
+            {
+              if ( cnt < ptrbuf[2] )
+              {
+                curr->addr = (void *)pmu;
+                curr->type = pmu->type;
+                curr->capabilities = pmu->capabilities;
+                curr->pmu_enable = (void *)pmu->pmu_enable;
+                curr->pmu_disable = (void *)pmu->pmu_disable;
+                curr->event_init = (void *)pmu->event_init;
+                curr->event_mapped = (void *)pmu->event_mapped;
+                curr->event_unmapped = (void *)pmu->event_unmapped;
+                curr->add = (void *)pmu->add;
+                curr->del = (void *)pmu->del;
+                curr->start = (void *)pmu->start;
+                curr->stop = (void *)pmu->stop;
+                curr->read = (void *)pmu->read;
+                curr->start_txn = (void *)pmu->start_txn;
+                curr->commit_txn = (void *)pmu->commit_txn;
+                curr->cancel_txn = (void *)pmu->cancel_txn;
+                curr->event_idx = (void *)pmu->event_idx;
+                curr->sched_task = (void *)pmu->sched_task;
+                curr->swap_task_ctx = (void *)pmu->swap_task_ctx;
+                curr->setup_aux = (void *)pmu->setup_aux;
+                curr->free_aux = (void *)pmu->free_aux;
+                curr->snapshot_aux = (void *)pmu->snapshot_aux;
+                curr->addr_filters_validate = (void *)pmu->addr_filters_validate;
+                curr->addr_filters_sync = (void *)pmu->addr_filters_sync;
+                curr->aux_output_match = (void *)pmu->aux_output_match;
+                curr->filter_match = (void *)pmu->filter_match;
+                curr->check_period = (void *)pmu->check_period;
+                curr++;
+              }
+              cnt++;
+            }
+            // unlock
+            mutex_unlock(m);
+            // copy to user
+            buf[0] = cnt;
+            if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+            {
+               kfree(buf);
+               return -EFAULT;
+            }
+            kfree(buf);
+          }
+        }
+      break; /* IOCTL_GET_PMUS */
+
     case IOCTL_GET_BPF_MAPS:
       if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
         return -EFAULT;
@@ -3160,6 +3854,7 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          {
            if ( prog == target )
            {
+             bpf_prog_inc(prog);
              if ( IOCTL_GET_BPF_PROG_BODY == ioctl_num )
                body = (char *)prog->bpf_func;
              else if ( IOCTL_GET_BPF_USED_MAPS == ioctl_num && prog->aux )
@@ -3172,9 +3867,14 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
          spin_unlock_bh(lock);
          if ( !body )
            return -ENOENT;
+         printk("ioctl %s body %p size %ld\n", get_ioctl_name(ioctl_num), body, ptrbuf[3]);
          // copy to user
          if (copy_to_user((void*)ioctl_param, (void*)body, ptrbuf[3]) > 0)
+         {
+           bpf_prog_put(prog);
            return -EFAULT;
+         }
+         bpf_prog_put(prog);
        }
      break; /* IOCTL_GET_BPF_PROG_BODY */
 
@@ -3349,6 +4049,106 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
         }
      break; /* IOCTL_GET_TRACE_EXPORTS */
 
+    case IOCTL_GET_BPF_RAW_EVENTS:
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+  	  return -EFAULT;
+  	else {
+          struct bpf_raw_event_map *start = (struct bpf_raw_event_map *)ptrbuf[0];
+          struct bpf_raw_event_map *end = (struct bpf_raw_event_map *)ptrbuf[1];
+          unsigned long cnt = 0;
+          if ( !ptrbuf[2] )
+          {
+            cnt = end - start;
+            if (copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0)
+              return -EFAULT;
+          } else {
+            struct one_bpf_raw_event *curr;
+            size_t kbuf_size = sizeof(unsigned long) + sizeof(struct one_bpf_raw_event) * ptrbuf[2];
+            unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL);
+            if ( !buf )
+              return -ENOMEM;
+            curr = (struct one_bpf_raw_event *)(buf + 1);
+            for ( ; start < end; start++ )
+            {
+              if ( cnt >= ptrbuf[2] )
+                break;
+              curr->addr = (void *)start;
+              curr->tp = (void *)start->tp;
+              curr->func = (void *)start->bpf_func;
+              curr->num_args = start->num_args;
+              curr++;
+              cnt++;
+            }
+            buf[0] = cnt;
+            kbuf_size = sizeof(unsigned long) + sizeof(struct one_bpf_raw_event) * cnt;
+            if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+            {
+              kfree(buf);
+              return -EFAULT;
+            }
+            kfree(buf);
+          }
+        }
+     break; /* IOCTL_GET_BPF_RAW_EVENTS */
+
+#ifdef CONFIG_FUNCTION_TRACER
+    case IOCTL_GET_FTRACE_OPS:
+        if ( !s_ftrace_end )
+          return -ENOCSI;
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+  	  return -EFAULT;
+  	else
+  	{
+          struct ftrace_ops **head = (struct ftrace_ops **)ptrbuf[0];
+          struct mutex *m = (struct mutex *)ptrbuf[1];
+          struct ftrace_ops *p;
+          unsigned long cnt = 0;
+          if ( !ptrbuf[2] )
+          {
+            // lock
+            mutex_lock(m);
+            for ( p = *head; p != s_ftrace_end; p = p->next )
+              cnt++;
+            // unlock
+            mutex_unlock(m);
+            if (copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0)
+              return -EFAULT;
+          } else {
+            struct one_ftrace_ops *curr;
+            size_t kbuf_size = sizeof(unsigned long) + sizeof(struct one_ftrace_ops) * ptrbuf[2];
+            unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL);
+            if ( !buf )
+              return -ENOMEM;
+            curr = (struct one_ftrace_ops *)(buf + 1);
+            // lock
+            mutex_lock(m);
+            // iterate
+            for ( p = *head; p != s_ftrace_end; p = p->next )
+            {
+              if ( cnt >= ptrbuf[2] )
+                break;
+              curr->addr = (void *)p;
+              curr->func = (void *)p->func;
+              curr->saved_func = (void *)p->saved_func;
+              curr->flags = p->flags;
+              curr++;
+              cnt++;
+            }
+            // unlock
+            mutex_unlock(m);
+            buf[0] = cnt;
+            kbuf_size = sizeof(unsigned long) + sizeof(struct one_ftrace_ops) * cnt;
+            if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+            {
+              kfree(buf);
+              return -EFAULT;
+            }
+            kfree(buf);
+          }
+        }
+     break; /* IOCTL_GET_FTRACE_OPS */
+#endif /* CONFIG_FUNCTION_TRACER */
+
     case IOCTL_GET_FTRACE_CMDS:
         if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
   	  return -EFAULT;
@@ -3395,6 +4195,54 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
           }
         }
      break; /* IOCTL_GET_FTRACE_CMDS */
+
+    case IOCTL_GET_DYN_EVENTS:
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
+  	  return -EFAULT;
+  	else {
+  	  unsigned long cnt = 0;
+          struct dyn_event *pos;
+          struct list_head *head = (struct list_head *)ptrbuf[0];
+          struct mutex *m = (struct mutex *)ptrbuf[1];
+          if ( !ptrbuf[2] )
+          {
+            mutex_lock(m);
+            list_for_each_entry(pos, head, list)
+              cnt++;
+            mutex_unlock(m);
+#ifdef _DEBUG
+            printk("IOCTL_GET_DYN_EVENTS %ld\n", cnt);
+#endif /* _DEBUG */
+            if (copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0)
+              return -EFAULT;
+          } else {
+            struct one_tracepoint_func *curr;
+            size_t kbuf_size = sizeof(unsigned long) + sizeof(struct one_tracepoint_func) * ptrbuf[2];
+            unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL);
+            if ( !buf )
+              return -ENOMEM;
+            curr = (struct one_tracepoint_func *)(buf + 1);
+            buf[0] = 0;
+            mutex_lock(m);
+            list_for_each_entry(pos, head, list)
+            {
+              if ( buf[0] >= ptrbuf[1] )
+                break;
+              curr->addr = (unsigned long)pos;
+              curr->data = (unsigned long)pos->ops;
+              curr++;
+              buf[0]++;
+            }
+            mutex_unlock(m);
+            if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+            {
+              kfree(buf);
+              return -EFAULT;
+            }
+            kfree(buf);
+          }
+        }
+     break; /* IOCTL_GET_DYN_EVENTS */
 
     case IOCTL_GET_DYN_EVT_OPS:
         if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
@@ -3648,15 +4496,64 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
         }
      break; /* IOCTL_GET_BPF_REGS */
 
-    case IOCTL_GET_LSM_HOOKS:
-        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+    case IOCTL_GET_BPF_KSYMS:
+        if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 3) > 0 )
   	  return -EFAULT;
   	else {
-          struct security_hook_list *shl;
-          struct hlist_head *head = (struct hlist_head *)ptrbuf[0];
-  	  // there is no sync - all numerous security_xxx just call call_xx_hook
-    	  if ( !ptrbuf[1] )
-  	  {
+          struct list_head *head = (struct list_head *)ptrbuf[0];
+          spinlock_t *lock = (spinlock_t *)ptrbuf[1];
+          unsigned long cnt = 0;
+          struct bpf_ksym *ti;
+          if ( !ptrbuf[2] )
+          {
+            spin_lock_bh(lock);
+            list_for_each_entry(ti, head, lnode)
+              cnt++;
+            spin_unlock_bh(lock);
+            if (copy_to_user((void*)ioctl_param, (void*)&cnt, sizeof(cnt)) > 0)
+              return -EFAULT;
+          } else {
+            struct one_bpf_ksym *curr;
+            size_t kbuf_size = sizeof(unsigned long) + sizeof(struct one_bpf_ksym) * ptrbuf[2];
+            unsigned long *buf = (unsigned long *)kmalloc(kbuf_size, GFP_KERNEL);
+            if ( !buf )
+              return -ENOMEM;
+            curr = (struct one_bpf_ksym *)(buf + 1);
+            spin_lock_bh(lock);
+            list_for_each_entry(ti, head, lnode)
+            {
+              if ( cnt >= ptrbuf[2] )
+                break;
+              curr->addr = ti;
+              curr->start = ti->start;
+              curr->end = ti->end;
+              curr->prog = ti->prog;
+              strlcpy(curr->name, ti->name, sizeof(curr->name));
+              curr++;
+              cnt++;
+            }
+            spin_unlock_bh(lock);
+            buf[0] = cnt;
+            kbuf_size = sizeof(unsigned long) + sizeof(struct one_bpf_ksym) * cnt;
+            if (copy_to_user((void*)ioctl_param, (void*)buf, kbuf_size) > 0)
+            {
+              kfree(buf);
+              return -EFAULT;
+            }
+            kfree(buf);
+          }
+       }
+     break; /* IOCTL_GET_BPF_KSYMS */
+
+    case IOCTL_GET_LSM_HOOKS:
+     if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+  	  return -EFAULT;
+  	 else {
+       struct security_hook_list *shl;
+       struct hlist_head *head = (struct hlist_head *)ptrbuf[0];
+  	   // there is no sync - all numerous security_xxx just call call_xx_hook
+    	 if ( !ptrbuf[1] )
+  	   {
             ptrbuf[0] = 0;
             hlist_for_each_entry(shl, head, list)
               ptrbuf[0]++;
@@ -3686,6 +4583,184 @@ static long lkcd_ioctl(struct file *file, unsigned int ioctl_num, unsigned long 
           }
         }
       break; /* IOCTL_GET_LSM_HOOKS */
+
+    case IOCTL_GET_ALARMS:
+      if ( !s_alarm )
+        return -ENOCSI;
+      if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+  	    return -EFAULT;
+      if ( ptrbuf[0] >= ALARM_NUMTYPE )
+        return -EINVAL;
+      else {
+        struct alarm_base *ca = s_alarm + ptrbuf[0];
+        struct rb_node *iter;
+        unsigned long flags;
+        if ( !ptrbuf[1] )
+        {
+          // calc count of alarms
+          ptrbuf[0] = 0;
+          // lock
+          spin_lock_irqsave(&ca->lock, flags);
+          for ( iter = rb_first(&ca->timerqueue.rb_root.rb_root); iter != NULL; iter = rb_next(iter) )
+            ptrbuf[0]++;
+          // unlock
+          spin_unlock_irqrestore(&ca->lock, flags);
+          ptrbuf[1] = (unsigned long)ca->get_ktime;
+          ptrbuf[2] = (unsigned long)ca->get_timespec;
+          // copy to user-mode
+          if (copy_to_user((void*)ioctl_param, (void*)ptrbuf, sizeof(ptrbuf[0]) * 3) > 0)
+            return -EFAULT;
+        } else {
+          size_t size = sizeof(unsigned long) + ptrbuf[1] * sizeof(struct one_alarm);
+          struct one_alarm *curr;
+          unsigned long cnt = 0;
+          unsigned long *kbuf = (unsigned long *)kmalloc(size, GFP_KERNEL);
+          if ( !kbuf )
+            return -ENOMEM;
+          curr = (struct one_alarm *)(kbuf + 1);
+          // lock
+          spin_lock_irqsave(&ca->lock, flags);
+          for ( iter = rb_first(&ca->timerqueue.rb_root.rb_root); iter != NULL && cnt < ptrbuf[1]; iter = rb_next(iter) )
+          {
+            struct timerqueue_node *node = rb_entry(iter, struct timerqueue_node, node);
+            struct alarm *a = (struct alarm *)node;
+            curr->addr = node;
+            curr->hr_timer = a->timer.function;
+            curr->func = a->function;
+            // for next iteration
+            cnt++;
+            curr++;
+          }
+          // unlock
+          spin_unlock_irqrestore(&ca->lock, flags);
+          kbuf[0] = cnt;
+          // copy collected data to user-mode
+          if (copy_to_user((void*)ioctl_param, (void*)kbuf, size) > 0)
+          {
+           kfree(kbuf);
+           return -EFAULT;
+          }
+          kfree(kbuf);
+        }
+      }
+     break; /* IOCTL_GET_ALARMS */
+
+    case IOCTL_GET_KTIMERS:
+     if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+  	  return -EFAULT;
+  	 else {
+      struct timer_base *tb = (struct timer_base *)ptrbuf[0];
+      unsigned long flags = 0;
+      int idx;
+      struct timer_list *tl;
+      if ( !ptrbuf[1] )
+      {
+        // calc count of timers
+        raw_spin_lock_irqsave(&tb->lock, flags);
+        for ( idx = 0; idx < WHEEL_SIZE; idx++ )
+        {
+          hlist_for_each_entry(tl, &tb->vectors[idx], entry)
+             ptrbuf[1]++;
+        }
+        // unlock
+        raw_spin_unlock_irqrestore(&tb->lock, flags);
+#if (BASE_STD	!= BASE_DEF)
+        tb++;
+        // lock
+        raw_spin_lock_irqsave(&tb->lock, flags);
+        for ( idx = 0; idx < WHEEL_SIZE; idx++ )
+        {
+          hlist_for_each_entry(tl, &tb->vectors[idx], entry)
+             ptrbuf[1]++;
+        }
+        // unlock
+        raw_spin_unlock_irqrestore(&tb->lock, flags);
+#endif        
+        // copy count to user-mode
+        if (copy_to_user((void*)ioctl_param, (void*)&ptrbuf[1], sizeof(ptrbuf[1])) > 0)
+          return -EFAULT;
+      } else {
+         struct ktimer *curr;
+         unsigned long size = sizeof(unsigned long) + ptrbuf[1] * sizeof(struct ktimer);
+         unsigned long *kbuf = (unsigned long *)kmalloc(size, GFP_KERNEL);
+         unsigned long cnt = 0;
+         if ( !kbuf )
+          return -ENOMEM;
+         curr = (struct ktimer *)(kbuf + 1);
+         // lock
+         raw_spin_lock_irqsave(&tb->lock, flags);
+         for ( idx = 0; idx < WHEEL_SIZE && cnt < ptrbuf[1]; idx++ )
+         {
+           hlist_for_each_entry(tl, &tb->vectors[idx], entry)
+           {
+             if ( cnt >= ptrbuf[1] )
+               break;
+             curr->addr = tl;
+             curr->wq_addr = NULL;
+             curr->exp = tl->expires;
+             if ( delayed_timer == tl->function )
+             {
+               struct delayed_work *dwork = from_timer(dwork, tl, timer);
+               curr->wq_addr = dwork;
+               curr->func = dwork->work.func;
+             } else
+               curr->func = tl->function;
+             curr->flags = tl->flags;
+             curr++;
+             cnt++;
+           }
+         }
+         // unlock
+         raw_spin_unlock_irqrestore(&tb->lock, flags);
+#if (BASE_STD	!= BASE_DEF)
+         tb++;
+         // lock
+         raw_spin_lock_irqsave(&tb->lock, flags);
+         for ( idx = 0; idx < WHEEL_SIZE && cnt < ptrbuf[1]; idx++ )
+         {
+           hlist_for_each_entry(tl, &tb->vectors[idx], entry)
+           {
+             if ( cnt >= ptrbuf[1] )
+               break;
+             curr->addr = tl;
+             curr->wq_addr = NULL;
+             curr->exp = tl->expires;
+             if ( delayed_timer == tl->function )
+             {
+               struct delayed_work *dwork = from_timer(dwork, tl, timer);
+               curr->wq_addr = dwork;
+               curr->func = dwork->work.func;
+             } else
+               curr->func = tl->function;
+             curr->flags = tl->flags;
+             curr++;
+             cnt++;
+           }
+         }
+         // unlock
+         raw_spin_unlock_irqrestore(&tb->lock, flags);
+#endif
+         // copy collected data to user-mode
+         kbuf[0] = cnt;
+         if (copy_to_user((void*)ioctl_param, (void*)kbuf, size) > 0)
+         {
+          kfree(kbuf);
+          return -EFAULT;
+         }
+         kfree(kbuf);
+      }
+     }
+     break; /* IOCTL_GET_KTIMERS */
+
+    case IOCTL_PATCH_KTEXT1:
+      if ( !s_patch_text )
+          return -ENOCSI;
+      if ( copy_from_user( (void*)ptrbuf, (void*)ioctl_param, sizeof(long) * 2) > 0 )
+  	    return -EFAULT;
+      else {
+        s_patch_text((void*)ptrbuf[0], ptrbuf + 1, 1);
+      }
+      break; /* IOCTL_PATCH_KTEXT1 */     
 
     default:
      return -EBADRQC;
@@ -3838,6 +4913,12 @@ static struct miscdevice lkcd_dev = {
     .fops = &kmem_fops
 };
 
+#ifdef HAS_ARM64_THUNKS
+#define SYM_LOAD(name, type, val)  val = (type)bti_wrap(name);
+#else
+#define SYM_LOAD(name, type, val)  val = (type)lkcd_lookup_name(name); if ( !val ) printk("cannot find %s", name); 
+#endif
+
 int __init
 init_module (void)
 {
@@ -3847,14 +4928,24 @@ init_module (void)
     printk("Unable to register the lkcd device\n");
     return ret;
   }
+#ifdef HAS_ARM64_THUNKS
+  if ( !init_bti_thunks() )
+  {
+    misc_deregister(&lkcd_dev);
+    return -ENOMEM;
+  }
+#endif /* HAS_ARM64_THUNKS */
+  k_pre_handler_kretprobe = (void *)lkcd_lookup_name("pre_handler_kretprobe");
+  if ( !k_pre_handler_kretprobe )
+    printk("cannot find pre_handler_kretprobe\n");  
   s_dbg_open = (const struct file_operations *)lkcd_lookup_name("debugfs_open_proxy_file_operations");
   if ( !s_dbg_open )
     printk("cannot find debugfs_open_proxy_file_operations\n");
   s_dbg_full = (const struct file_operations *)lkcd_lookup_name("debugfs_full_proxy_file_operations");
   if ( !s_dbg_full )
     printk("cannot find debugfs_full_proxy_file_operations\n");
-  krnf_node_ptr = (krnf_node_type)lkcd_lookup_name("kernfs_node_from_dentry");
-  iterate_supers_ptr = (und_iterate_supers)lkcd_lookup_name("iterate_supers");
+  SYM_LOAD("kernfs_node_from_dentry", krnf_node_type, krnf_node_ptr)
+  SYM_LOAD("iterate_supers", und_iterate_supers, iterate_supers_ptr)
   mount_lock = (seqlock_t *)lkcd_lookup_name("mount_lock");
   if ( !mount_lock )
     printk("cannot find mount_lock\n");
@@ -3871,6 +4962,9 @@ init_module (void)
   if ( !s_sock_diag_table_mutex )
     printk("cannot find sock_diag_table_mutex\n");
   // trace events data
+  s_ftrace_end = (struct ftrace_ops *)lkcd_lookup_name("ftrace_list_end");
+  if ( !s_ftrace_end )
+    printk("cannot find ftrace_list_end\n");
   s_trace_event_sem = (struct rw_semaphore *)lkcd_lookup_name("trace_event_sem");
   if ( !s_trace_event_sem )
     printk("cannot find trace_event_sem\n");
@@ -3886,40 +4980,44 @@ init_module (void)
   s_tracepoints_mutex = (struct mutex *)lkcd_lookup_name("tracepoints_mutex");
   if ( !s_tracepoints_mutex )
     printk("cannot find tracepoints_mutex\n");
-  bpf_prog_array_length_ptr = (und_bpf_prog_array_length)lkcd_lookup_name("bpf_prog_array_length");
-  if ( !bpf_prog_array_length_ptr )
-    printk("cannot find bpf_prog_array_length\n");
+  SYM_LOAD("bpf_prog_array_length", und_bpf_prog_array_length, bpf_prog_array_length_ptr)
   css_next_child_ptr = (kcss_next_child)lkcd_lookup_name("css_next_child");
   if ( !css_next_child_ptr )
     printk("cannot find css_next_child\n");
-  cgroup_bpf_detach_ptr = (kcgroup_bpf_detach)lkcd_lookup_name("cgroup_bpf_detach");
-  if ( !cgroup_bpf_detach_ptr )
-    printk("cannot find cgroup_bpf_detach\n");
+  SYM_LOAD("cgroup_bpf_detach", kcgroup_bpf_detach, cgroup_bpf_detach_ptr)
+  SYM_LOAD("text_poke_kgdb", t_patch_text, s_patch_text)
+  delayed_timer = (void *)lkcd_lookup_name("delayed_work_timer_fn");
+  if ( !delayed_timer )
+    printk("cannot find delayed_work_timer_fn");
+  s_alarm = (struct alarm_base *)lkcd_lookup_name("alarm_bases");
+  if ( !s_alarm )
+    printk("cannot find alarm_bases");
 #ifdef CONFIG_FSNOTIFY
   fsnotify_mark_srcu_ptr = (struct srcu_struct *)lkcd_lookup_name("fsnotify_mark_srcu");
-  fsnotify_first_mark_ptr = (und_fsnotify_first_mark)lkcd_lookup_name("fsnotify_first_mark");
+  SYM_LOAD("fsnotify_first_mark", und_fsnotify_first_mark, fsnotify_first_mark_ptr)
   if ( !fsnotify_first_mark_ptr )
   {
-    printk("cannot find fsnotify_first_mark\n");
     if ( fsnotify_mark_srcu_ptr )
       fsnotify_first_mark_ptr = my_fsnotify_first_mark;
   }
-  fsnotify_next_mark_ptr = (und_fsnotify_next_mark)lkcd_lookup_name("fsnotify_next_mark");
+  SYM_LOAD("fsnotify_next_mark", und_fsnotify_next_mark, fsnotify_next_mark_ptr) 
   if ( !fsnotify_next_mark_ptr )
   {
-    printk("cannot find fsnotify_next_mark\n");
     if ( fsnotify_mark_srcu_ptr )
       fsnotify_next_mark_ptr = my_fsnotify_next_mark;
   }
 #endif /* CONFIG_FSNOTIFY */
-#ifdef __x86_64__
   kprobe_aggr = (unsigned long)lkcd_lookup_name("aggr_pre_handler");
+#ifdef CONFIG_UPROBES
   find_uprobe_ptr = (find_uprobe)lkcd_lookup_name("find_uprobe");
   get_uprobe_ptr = (get_uprobe)lkcd_lookup_name("get_uprobe");
   if ( !get_uprobe_ptr )
     get_uprobe_ptr = my_get_uprobe;
   put_uprobe_ptr = (put_uprobe)lkcd_lookup_name("put_uprobe");
-#endif /* __x86_64__ */
+#endif
+#ifdef HAS_ARM64_THUNKS
+  bti_thunks_lock_ro();
+#endif
   return 0;
 }
 
@@ -3931,16 +5029,21 @@ void cleanup_module (void)
      user_return_notifier_unregister(&s_urn);
      urn_installed = 0;
   }
+#endif /* __x86_64__ */
   if ( test_kprobe_installed )
   {
      unregister_kprobe(&test_kp);
      test_kprobe_installed = 0;
   }
+#ifdef CONFIG_UPROBES
   if ( debuggee_inode )
   {
      uprobe_unregister(debuggee_inode, DEBUGGEE_FILE_OFFSET, &s_uc);
      debuggee_inode = 0;
   }
-#endif /* __x86_64__ */
+#endif
+#ifdef HAS_ARM64_THUNKS
+  finit_bti_thunks();
+#endif  
   misc_deregister(&lkcd_dev);
 }

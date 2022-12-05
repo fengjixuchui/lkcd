@@ -1,6 +1,7 @@
 #include "types.h"
 #include "bpf.h"
 #include <stdlib.h>
+#include "jmem.h"
 
 #define PAGE_SIZE 	0x1000
 #define MAX_ERRNO	4095
@@ -35,6 +36,29 @@ static inline void *ERR_PTR(long error)
 
 int bpf_jit_enable = 1;
 u64 __bpf_call_base = 0;
+void *__bpf_prog_enter = 0;
+void *__bpf_prog_exit = 0;
+void *__bpf_prog_enter_sleepable = 0;
+void *__bpf_prog_exit_sleepable = 0;
+void *__bpf_tramp_enter = 0;
+void *__bpf_tramp_exit = 0;
+// absolute values in real kernel
+static u64 _base = 0;
+static u64 _enter = 0;
+static u64 _ex = 0;
+static char *original_jit_addr = NULL;
+
+void put_call_base(u64 addr, u64 enter, u64 ex)
+{
+  _base = addr;
+  _enter = enter;
+  _ex = ex;
+}
+
+void put_original_jit_addr(void *addr)
+{
+  original_jit_addr = (char *)addr;
+}
 
 void *kzalloc(size_t size, int flags)
 {
@@ -59,6 +83,25 @@ void *kmalloc_array(size_t n, size_t size, int flags)
   return malloc(n * size);
 }
 
+void *kvmalloc_array(size_t n, size_t size, int flags)
+{
+  void *res = malloc(n * size);
+  if ( !res )
+    return res;
+   memset(res, 0, n * size);
+   return res;
+}
+
+void *kvcalloc(size_t n, size_t size, int flags)
+{
+  return calloc(n, size);
+}
+
+void kvfree(void *addr)
+{
+  free(addr);
+}
+
 static inline bool bpf_pseudo_func(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_LD | BPF_IMM | BPF_DW) &&
@@ -68,10 +111,17 @@ static inline bool bpf_pseudo_func(const struct bpf_insn *insn)
 void __bpf_prog_free(struct bpf_prog *fp)
 {
 	if (fp->aux) {
+	  if ( fp->aux->poke_tab )
 		free(fp->aux->poke_tab);
-		free(fp->aux);
+// aux located at stack inside ujit2file/ujit2mem
+//		free(fp->aux);
 	}
 	free(fp);
+}
+
+void bpf_prog_unlock_free(struct bpf_prog *fp)
+{
+ __bpf_prog_free(fp);
 }
 
 static void bpf_prog_clone_free(struct bpf_prog *fp)
@@ -442,6 +492,7 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 out:
 	return to - to_buff;
 }
+
 struct bpf_prog *bpf_jit_blind_constants(struct bpf_prog *prog)
 {
 	struct bpf_insn insn_buff[16], aux[2];
@@ -536,6 +587,39 @@ void bpf_prog_fill_jited_linfo(struct bpf_prog *prog,
 			insn_to_jit_off[linfo[i].insn_off - insn_start - 1];
 }
 
+int bpf_jit_get_func_addr(const struct bpf_prog *prog,
+			  const struct bpf_insn *insn, bool extra_pass,
+			  u64 *func_addr, bool *func_addr_fixed)
+{
+	s16 off = insn->off;
+	s32 imm = insn->imm;
+	u8 *addr;
+
+	*func_addr_fixed = insn->src_reg != BPF_PSEUDO_CALL;
+	if (!*func_addr_fixed) {
+		/* Place-holder address till the last pass has collected
+		 * all addresses for JITed subprograms in which case we
+		 * can pick them up from prog->aux.
+		 */
+		if (!extra_pass)
+			addr = NULL;
+		else if (prog->aux->func &&
+			 off >= 0 && off < prog->aux->func_cnt)
+			addr = (u8 *)prog->aux->func[off]->bpf_func;
+		else
+			return -EINVAL;
+	} else {
+		/* Address of a BPF helper call. Since part of the core
+		 * kernel, it's always at a fixed location. __bpf_call_base
+		 * and the helper with imm relative to it are both in core
+		 * kernel.
+		 */
+		addr = (u8 *)__bpf_call_base + imm;
+	}
+
+	*func_addr = (unsigned long)addr;
+	return 0;
+}
 void flush_icache_range(unsigned long start, unsigned long end)
 {
 }
@@ -588,6 +672,10 @@ void bpf_jit_dump(unsigned int flen, unsigned int proglen, u32 pass, void *image
   HexDump(image, proglen);
 }
 
+void print_fn_code(unsigned char *code, unsigned long len)
+{
+}
+
 void cond_resched()
 {
 }
@@ -596,26 +684,139 @@ void bpf_jit_binary_lock_ro(struct bpf_binary_header *hdr)
 {
 }
 
+bool is_bpf_text_address(unsigned long addr)
+{
+  printf("is_bpf_text_address(%lX)\n", addr);
+  return false;
+}
+
 struct bpf_binary_header *
 bpf_jit_binary_alloc(unsigned int proglen, u8 **image_ptr,
 		     unsigned int alignment,
 		     bpf_jit_fill_hole_t bpf_fill_ill_insns)
 {
   struct bpf_binary_header *hdr;
-  u32 size, hole, start = 0;
+  u32 size, start = 0;
+  ptrdiff_t off;
+
   size = round_up(proglen + sizeof(*hdr) + 128, PAGE_SIZE);
   hdr = malloc(size);
+printf("bpf_jit_binary_alloc(%X) %p\n", size, hdr); fflush(stdout);
   if ( !hdr )
     return NULL;
+  jmem_store(hdr);
   hdr->size = size;
-  hole = min(size - (proglen + sizeof(*hdr)), PAGE_SIZE - sizeof(*hdr));
+//  hole = min(size - (proglen + sizeof(*hdr)), PAGE_SIZE - sizeof(*hdr));
 
-  /* Leave a random number of instructions before BPF code. */
   *image_ptr = &hdr->image[start];
+  /* adjust __bpf_call_base */
+  off = original_jit_addr - (char *)*image_ptr;
+#ifdef _DEBUG
+ printf("original_jit_addr %p off %lX\n", original_jit_addr, off);
+#endif
+  __bpf_call_base = _base - off;
+  __bpf_prog_enter = (char *)_enter - off;
+  __bpf_prog_exit = (char *)_ex - off;
   return hdr;  
 }
 
 void bpf_jit_binary_free(struct bpf_binary_header *hdr)
 {
+  jmem_remove(hdr);
   free(hdr);
+}
+
+void text_poke_bp(void *addr, const void *opcode, size_t len, const void *emulate)
+{
+  printf("text_poke_bp called, addr %p, len %lX\n", addr, len);
+}
+
+int is_kernel_text(unsigned long addr)
+{
+  return 0;
+}
+
+void smp_wmb()
+{
+}
+
+void __set_bit(unsigned int nr, volatile unsigned long *addr)
+{
+  *addr |= (1UL << nr);
+}
+
+int test_bit(int nr, const volatile unsigned long *addr)
+{
+  if ( (1UL << nr) & *addr )
+    return 1;
+   return 0;
+}
+
+unsigned long __ffs(unsigned long word)
+{
+	int num = 0;
+
+#if __BITS_PER_LONG == 64
+	if ((word & 0xffffffff) == 0) {
+		num += 32;
+		word >>= 32;
+	}
+#endif
+	if ((word & 0xffff) == 0) {
+		num += 16;
+		word >>= 16;
+	}
+	if ((word & 0xff) == 0) {
+		num += 8;
+		word >>= 8;
+	}
+	if ((word & 0xf) == 0) {
+		num += 4;
+		word >>= 4;
+	}
+	if ((word & 0x3) == 0) {
+		num += 2;
+		word >>= 2;
+	}
+	if ((word & 0x1) == 0)
+		num += 1;
+	return num;
+}
+
+unsigned long __fls(unsigned long word)
+{
+ 	int num = BITS_PER_LONG - 1;
+
+#if BITS_PER_LONG == 64
+	if (!(word & (~0ul << 32))) {
+		num -= 32;
+		word <<= 32;
+	}
+#endif
+	if (!(word & (~0ul << (BITS_PER_LONG-16)))) {
+		num -= 16;
+		word <<= 16;
+	}
+	if (!(word & (~0ul << (BITS_PER_LONG-8)))) {
+		num -= 8;
+		word <<= 8;
+	}
+	if (!(word & (~0ul << (BITS_PER_LONG-4)))) {
+		num -= 4;
+		word <<= 4;
+	}
+	if (!(word & (~0ul << (BITS_PER_LONG-2)))) {
+		num -= 2;
+		word <<= 2;
+	}
+	if (!(word & (~0ul << (BITS_PER_LONG-1))))
+		num -= 1;
+	return num;
+}
+
+int fls64(__u64 x)
+{
+	if (x == 0)
+		return 0;
+	return __fls(x) + 1;
 }

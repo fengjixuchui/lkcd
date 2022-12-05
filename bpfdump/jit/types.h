@@ -11,6 +11,13 @@
 #include <stdio.h>
 #include <assert.h>
 
+#define __ALIGN_KERNEL_MASK(x, mask)	(((x) + (mask)) & ~(mask))
+#define ALIGN(x, a)		__ALIGN_KERNEL_MASK(x, (typeof(x))(a) - 1)
+#define PTR_ALIGN(p, a)		((typeof(p))ALIGN((unsigned long)(p), (a)))
+#define READ_ONCE(x)		(*(const volatile typeof(x) *)&(x))
+
+#define BITS_PER_LONG 64
+
 #define ENOTSUPP	524	/* Operation is not supported */
 
 #define BUG_ON(__BUG_ON_cond) assert(!(__BUG_ON_cond))
@@ -24,7 +31,10 @@ do {									\
 	void *__mptr = (void *)(ptr);					\
 	((type *)(__mptr - offsetof(type, member))); })
 
-#define pr_err(...) fprintf (stderr, __VA_ARGS__)
+#define pr_err(...) fprintf(stderr,  __VA_ARGS__)
+#define pr_err_once(...) fprintf(stderr,  __VA_ARGS__)
+#define pr_info(...) fprintf(stderr, __VA_ARGS__)
+#define pr_err_ratelimited(...) fprintf(stderr, __VA_ARGS__)
 #define BUILD_BUG_ON(x)
 
 #define GFP_KERNEL 0
@@ -35,6 +45,10 @@ extern const unsigned char * const *ideal_nops;
 
 #define __round_mask(x, y) ((__typeof__(x))((y)-1))
 #define round_up(x, y) ((((x)-1) | __round_mask(x, y))+1)
+#define round_down(x, y) ((x) & ~__round_mask(x, y))
+
+unsigned long __fls(unsigned long word);
+int fls64(__u64 x);
 
 #define DECLARE_BITMAP(name,bits) \
 	unsigned long name[BITS_TO_LONGS(bits)]
@@ -357,7 +371,15 @@ void kfree(void *ptr);
 void *kzalloc(size_t size, int);
 void *kcalloc(size_t n, size_t size, int flags);
 void *kmalloc_array(size_t n, size_t size, int flags);
+void *kvmalloc_array(size_t n, size_t size, int flags);
+void *kvcalloc(size_t n, size_t size, int flags);
+void kvfree(void *addr);
 bool IS_ERR(const void *ptr);
+
+void smp_wmb();
+int test_bit(int nr, const volatile unsigned long *addr);
+unsigned long __ffs(unsigned long word);
+void __set_bit(unsigned int nr, volatile unsigned long *addr);
 
 #endif /*  __ASSEMBLY__ */
 #endif /* _LINUX_TYPES_H */
